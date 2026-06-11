@@ -1,0 +1,280 @@
+"""The engine: per-second estimate/logging tick, trade-driven paper fills, and
+settlement — now multi-market. Each MarketState carries its asset; the engine
+routes it to that asset's Binance feed (feed.price_at(symbol, ...)) and de-bias
+(debias[asset]). The gate is RELATIVE (THR_BPS of the estimated price) so it
+scales across BTC (~$62k) and ETH (~$1.7k) without a per-asset constant.
+
+Fill model (mirrors backtest/analysis/final_strategy.py): lock the bet side at
+sec_to_close==TAU_DECISION using the causal de-biased TWAP margin; while
+sec_to_close in [SEC_LO, SEC_HI] and the gate holds, every winning-side print at
+price <= CAP is a panic seller we fade -> a paper fill. Hold to settlement.
+"""
+from __future__ import annotations
+import math, time
+from . import config as C
+from .market import MarketState
+
+
+def maker_order_fee(qty: float, p: float) -> float:
+    """Kalshi MAKER fee in $ for ONE order of `qty` contracts at price `p`:
+    round_up_cent(MAKER_FEE_RATE * qty * p * (1-p)). The round-up is per ORDER
+    (qty inside), so it amortizes across size instead of the old per-contract 1c
+    floor. We rest bids -> we are the maker, so this is the rate that applies."""
+    return math.ceil(C.MAKER_FEE_RATE * qty * p * (1.0 - p) * 100) / 100.0
+
+
+def maker_fee_per_ct(p: float) -> float:
+    """Per-contract maker fee approximation (ignores rounding) — for sizing only."""
+    return C.MAKER_FEE_RATE * p * (1.0 - p)
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_ppf(p: float) -> float:
+    """Inverse normal CDF via bisection (computed once, for display threshold)."""
+    lo, hi = -10.0, 10.0
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        if _norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def _remaining_var_factor(n_rem: int) -> float:
+    """sum_{i,j in 1..n_rem} min(i,j) / 60^2. The remaining (unlocked) settlement
+    samples are collected 1..n_rem seconds ahead and share one Brownian path;
+    Var(S) = sigma_sec^2 * this. Matches fade_lib.remaining_var_factor."""
+    if n_rem <= 1:
+        return 0.0
+    s = 0
+    for i in range(1, n_rem + 1):
+        s += i * (i + 1) // 2 + (n_rem - i) * i   # sum_j min(i,j)
+    return s / (60.0 ** 2)
+
+
+Z_GATE = _norm_ppf(C.P_SIDE_MIN)   # margin (in sd_S units) needed to pass p_side gate
+
+
+class Engine:
+    def __init__(self, store, feed, disc, debias: dict, market_meta: dict, log) -> None:
+        self.store = store
+        self.feed = feed
+        self.disc = disc
+        self.debias = debias                 # asset -> Debias
+        self.meta = market_meta              # series -> {asset, symbol}
+        self.log = log
+        self.states: dict[str, MarketState] = {}
+        self.cash = C.BANKROLL
+        self.realized = 0.0
+        self.n_trades = 0
+        self.last_px_logged: dict[str, int] = {}
+
+    # ---- discovery hook -----------------------------------------------------
+    def sync_markets(self, actives: list[dict]) -> set[str]:
+        for a in actives:
+            if a["ticker"] not in self.states:
+                self.states[a["ticker"]] = MarketState(
+                    a["ticker"], a["close_ts"], a["strike"],
+                    a["asset"], a["symbol"], a["series"])
+                self.store.event("market_open",
+                                 f"{a['ticker']} {a['asset']} close={a['close_ts']} strike={a['strike']}")
+                self.log(f"tracking {a['ticker']} [{a['asset']}] strike={a['strike']:.2f}")
+        return {tk for tk, s in self.states.items() if not s.settled}
+
+    # ---- WS callbacks -------------------------------------------------------
+    def on_snapshot(self, tk: str, msg: dict) -> None:
+        s = self.states.get(tk)
+        if s:
+            s.book.snapshot(msg)
+            s.have_book = True
+
+    def on_delta(self, tk: str, msg: dict) -> None:
+        s = self.states.get(tk)
+        if s and s.have_book:
+            s.book.delta(msg)
+
+    def on_lifecycle(self, tk: str, msg: dict) -> None:
+        self.store.event("lifecycle", f"{tk} {msg.get('event_type')}")
+
+    def on_trade(self, tk: str, msg: dict) -> None:
+        s = self.states.get(tk)
+        if not s:
+            return
+        now = time.time()
+        sec = s.sec_to_close(now)
+        yp = _f(msg.get("yes_price_dollars"))
+        np_ = _f(msg.get("no_price_dollars"))
+        sz = _f(msg.get("count_fp")) or 0.0
+        self.store.trade(tk, sec, yp, np_, sz, msg.get("taker_side", ""))
+        self.n_trades += 1
+        self._maybe_fill(s, sec, yp, np_, sz)
+
+    def portfolio_value(self) -> float:
+        """Current account value = cash + cost basis of open positions. The 10%
+        bet sizes off this, so it compounds with the running balance."""
+        open_cost = sum(st.window_cost for st in self.states.values() if not st.settled)
+        return self.cash + open_cost
+
+    def _maybe_fill(self, s: MarketState, sec: float, yp, np_, sz: float) -> None:
+        if not (s.decided and s.gate_active and s.bet_yes is not None):
+            return
+        if not (C.SEC_LO <= sec <= C.SEC_HI):
+            return
+        win_px = yp if s.bet_yes else np_
+        # genuine-discount window: reject cheap adverse-selection prints (floor) and
+        # non-discounts (cap). Below the floor the market is confidently correct.
+        if win_px is None or not (C.WIN_PX_FLOOR <= win_px <= C.CAP):
+            return
+        # EV guard: only fade when the blended prob beats the price (model underpriced).
+        p_win = C.Q_BLEND_MODEL * s.p_side + (1.0 - C.Q_BLEND_MODEL) * win_px
+        if p_win <= win_px:
+            return
+        # --- sizing: 10% of current portfolio per window, rounded UP, integer ----
+        if s.budget_ct is None:                           # set once, at the first fill
+            target = max(C.MIN_WINDOW_NOTIONAL,           # >= $5/trade floor
+                         C.PORTFOLIO_FRACTION * self.portfolio_value())
+            s.budget_ct = math.ceil(target / win_px)      # round UP -> notional >= target
+        remaining = s.budget_ct - int(s.total_qty)
+        if remaining <= 0:
+            return
+        avail = int(sz * C.CAP_FRAC)                       # whole contracts offered
+        cash_ct = int(self.cash / win_px)                 # whole contracts we can afford
+        ceil_ct = int((C.MAX_WINDOW_NOTIONAL - s.window_cost) / win_px)
+        qty = min(remaining, avail, cash_ct, ceil_ct)
+        if qty < 1:
+            return
+        f = maker_order_fee(qty, win_px)                  # per-ORDER fee (one round-up)
+        cost = qty * win_px
+        self.cash -= cost
+        s.window_cost += cost
+        s.total_qty += qty
+        s.fills.append((win_px, qty, f))
+        self.store.fill(s.ticker, sec, "yes" if s.bet_yes else "no", win_px, qty, f,
+                        cost, s.decision_margin,
+                        f"fade p_side={s.p_side:.3f} 10%->{s.budget_ct}ct")
+
+    # ---- per-second tick ----------------------------------------------------
+    def tick(self) -> None:
+        now = time.time()
+        for s in list(self.states.values()):
+            if s.settled:
+                continue
+            latest = self.feed.latest(s.symbol)
+            if latest is None:
+                continue
+            spot_sec, spot = latest
+            if self.last_px_logged.get(s.symbol) != spot_sec:
+                self.store.price(s.symbol, spot_sec, spot)
+                self.last_px_logged[s.symbol] = spot_sec
+            sec = s.sec_to_close(now)
+            if sec < -5:
+                continue
+            delta = self.debias[s.asset].delta()
+            mhat, margin, n_lock, lmean, shat, sd_S = self._estimate(s, now, spot, delta)
+            p_side = _norm_cdf(abs(margin) / sd_S)   # model P(the favored side wins)
+            thr_abs = Z_GATE * sd_S                  # margin needed to clear p_side gate (display)
+            if not s.decided and C.SEC_LO <= sec <= C.TAU_DECISION:
+                s.decided = True
+                s.bet_yes = margin > 0
+                s.decision_margin = margin
+                s.sd_S = sd_S
+                s.p_side = p_side
+                s.gate_active = p_side >= C.P_SIDE_MIN
+                self.store.event("decision",
+                    f"{s.ticker} [{s.asset}] sec={sec:.0f} margin={margin:+.1f} "
+                    f"sd={sd_S:.1f} p_side={p_side:.4f} bet={'YES' if s.bet_yes else 'NO'} "
+                    f"gate={'ON' if s.gate_active else 'off'}")
+                self.log(f"DECISION {s.ticker} [{s.asset}] margin={margin:+.1f} "
+                         f"sd={sd_S:.1f} p_side={p_side:.4f} bet={'YES' if s.bet_yes else 'NO'} "
+                         f"gate={'ON' if s.gate_active else 'off'}")
+            b = s.book
+            byb, bnb = b.best_yes_bid(), b.best_no_bid()
+            self.store.book(s.ticker, sec, byb, b.yes.get(byb, 0.0) if byb else 0.0,
+                            bnb, b.no.get(bnb, 0.0) if bnb else 0.0,
+                            b.yes_ask(), b.no_ask(),
+                            sum(b.yes.values()), sum(b.no.values()), b.compact())
+            self.store.estimate(s.ticker, s.asset, sec, spot, n_lock, lmean, shat, delta,
+                                mhat, s.strike, margin, thr_abs,
+                                ("yes" if s.bet_yes else "no") if s.decided else None,
+                                s.gate_active, s.decided)
+
+    def _estimate(self, s: MarketState, now: float, spot: float, delta: float):
+        start = s.close_ts - C.SETTLE_SECS
+        n_elapsed = min(C.SETTLE_SECS, max(0, int(now) - start))
+        locked = [self.feed.price_at(s.symbol, e) for e in range(start, start + n_elapsed)]
+        locked = [p for p in locked if p is not None]
+        n_lock = len(locked)
+        lmean = sum(locked) / n_lock if n_lock else spot
+        shat = (lmean * n_elapsed + spot * (C.SETTLE_SECS - n_elapsed)) / C.SETTLE_SECS
+        mhat = shat - delta
+        margin = mhat - s.strike
+        # settlement-estimate std: diffusion of the n_rem unlocked samples + causal
+        # de-bias tracking std. Drives p_side = norm_cdf(|margin| / sd_S).
+        n_rem = max(0, C.SETTLE_SECS - n_elapsed)
+        sigma_sec = self.feed.recent_sigma(s.symbol, C.SIGMA_LOOKBACK)
+        if sigma_sec is None:
+            sigma_sec = C.SIGMA_FALLBACK_BPS / 1e4 * spot
+        proxy_sd = self.debias[s.asset].resid_std()
+        if proxy_sd is None:
+            proxy_sd = C.PROXY_SD_FALLBACK_BPS / 1e4 * abs(mhat)
+        diff_var = sigma_sec ** 2 * _remaining_var_factor(n_rem)
+        sd_S = math.sqrt(diff_var + proxy_sd ** 2) or 1e-6
+        return mhat, margin, n_lock, lmean, shat, sd_S
+
+    # ---- settlement ---------------------------------------------------------
+    def settle_closed(self) -> None:
+        now = time.time()
+        for s in list(self.states.values()):
+            if s.settled or s.sec_to_close(now) > -2:
+                continue
+            res = self.disc.settled(s.ticker)
+            if res:
+                self._settle(s, res)
+
+    def _settle(self, s: MarketState, res: dict) -> None:
+        true_settle, result = res["true_settle"], res["result"]
+        won = (s.bet_yes and result == "yes") or (s.bet_yes is False and result == "no")
+        payout = s.total_qty * 1.0 if won else 0.0
+        fees = sum(f for _, _, f in s.fills)   # f is per-ORDER total maker fee
+        gross = payout - s.window_cost
+        net = gross - fees
+        self.cash += payout - fees
+        self.realized += net
+        avg_px = (sum(p * q for p, q, _ in s.fills) / s.total_qty) if s.total_qty else None
+        self.store.window((s.ticker, s.asset, s.series, s.close_ts, s.strike, true_settle,
+                           result, s.decision_margin,
+                           "yes" if s.bet_yes else ("no" if s.decided else None),
+                           int(s.gate_active), len(s.fills), s.total_qty, avg_px,
+                           gross, fees, net, int(won) if s.decided else None, self.cash))
+        b60 = self._local_avg60(s.symbol, s.close_ts) or \
+            self.disc.binance_avg60(s.symbol, s.close_ts)
+        if b60 is not None:
+            err = b60 - true_settle
+            self.debias[s.asset].add(s.close_ts, err)
+            self.store.debias_row(s.ticker, s.asset, s.close_ts, b60, true_settle, err)
+        s.settled = True
+        if s.fills:
+            self.log(f"SETTLED {s.ticker} [{s.asset}] {result.upper()} "
+                     f"{'WIN' if won else 'LOSS'} qty={s.total_qty:.1f} "
+                     f"net=${net:+.3f} bal=${self.cash:.2f}")
+        else:
+            why = ("gate off" if (s.decided and not s.gate_active)
+                   else "no decision" if not s.decided else "no panic print<=CAP")
+            self.store.event("settled_notrade", f"{s.ticker} {result} ({why})")
+            self.log(f"SETTLED {s.ticker} [{s.asset}] {result.upper()} no-trade ({why})")
+
+    def _local_avg60(self, symbol: str, close_ts: int):
+        ps = [self.feed.price_at(symbol, e) for e in range(close_ts - C.SETTLE_SECS, close_ts)]
+        ps = [p for p in ps if p is not None]
+        return sum(ps) / len(ps) if len(ps) >= 30 else None
+
+
+def _f(v):
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None

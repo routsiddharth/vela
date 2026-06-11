@@ -1,0 +1,30 @@
+# --- secrets (NEVER commit) ---
+.env
+.env.local
+*.pem
+*.key
+
+# --- python ---
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# --- runtime data / firehose (livepaper/data is ~10GB) ---
+livepaper/data/
+backtest/data/
+testing/data/
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+*.log
+*.parquet
+*.pid
+
+# --- os / editor ---
+.DS_Store
+.idea/
+.vscode/
