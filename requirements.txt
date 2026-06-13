@@ -1,0 +1,6 @@
+# Vela live bot runtime deps (Python 3.11+)
+websockets>=13
+httpx>=0.27
+certifi>=2024.0.0
+cryptography>=42
+python-dotenv>=1.0

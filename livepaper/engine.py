@@ -56,11 +56,15 @@ def _remaining_var_factor(n_rem: int) -> float:
     return s / (60.0 ** 2)
 
 
-Z_GATE = _norm_ppf(C.P_SIDE_MIN)   # margin (in sd_S units) needed to pass p_side gate
+Z_GATE = _norm_ppf(C.P_SIDE_MIN)   # margin (in sd_S units) to pass the default gate
+# Per-asset gate thresholds in sd_S units, so thr_abs (the displayed/stored "margin
+# needed") matches whichever gate actually applies to that asset.
+Z_GATE_BY_ASSET = {a: _norm_ppf(p) for a, p in C.P_SIDE_MIN_BY_ASSET.items()}
 
 
 class Engine:
-    def __init__(self, store, feed, disc, debias: dict, market_meta: dict, log) -> None:
+    def __init__(self, store, feed, disc, debias: dict, market_meta: dict, log,
+                 live_broker=None) -> None:
         self.store = store
         self.feed = feed
         self.disc = disc
@@ -72,6 +76,19 @@ class Engine:
         self.realized = 0.0
         self.n_trades = 0
         self.last_px_logged: dict[str, int] = {}
+        # ---- LIVE trading (real Kalshi orders); None in paper mode --------------
+        self.live = None
+        if C.LIVE or live_broker is not None:
+            from .live_exec import LiveExecutor
+            if live_broker is None:
+                from .broker import LiveBroker
+                live_broker = LiveBroker(demo=C.LIVE_DEMO)
+            self.live = LiveExecutor(live_broker, store, log, C.DATA)
+            self.live.attach(self.states)
+            self.live.startup_reconcile()
+            if self.live.balance is not None:
+                self.cash = self.live.balance     # start accounting from REAL balance
+            self.log(f"[live] LIVE TRADING ENABLED — real orders, ${C.POSITION_USD}/window")
 
     # ---- discovery hook -----------------------------------------------------
     def sync_markets(self, actives: list[dict]) -> set[str]:
@@ -120,6 +137,8 @@ class Engine:
         return self.cash + open_cost
 
     def _maybe_fill(self, s: MarketState, sec: float, yp, np_, sz: float) -> None:
+        if self.live is not None:
+            return                # LIVE: fills come from real orders, not the tape sim
         if not (s.decided and s.gate_active and s.bet_yes is not None):
             return
         if not (C.SEC_LO <= sec <= C.SEC_HI):
@@ -160,6 +179,8 @@ class Engine:
     # ---- per-second tick ----------------------------------------------------
     def tick(self) -> None:
         now = time.time()
+        if self.live is not None:
+            self.live.poll_and_manage(now)   # kill-check, apply real fills, cancel near close
         for s in list(self.states.values()):
             if s.settled:
                 continue
@@ -176,14 +197,15 @@ class Engine:
             delta = self.debias[s.asset].delta()
             mhat, margin, n_lock, lmean, shat, sd_S = self._estimate(s, now, spot, delta)
             p_side = _norm_cdf(abs(margin) / sd_S)   # model P(the favored side wins)
-            thr_abs = Z_GATE * sd_S                  # margin needed to clear p_side gate (display)
+            gate_min = C.P_SIDE_MIN_BY_ASSET.get(s.asset, C.P_SIDE_MIN)   # per-asset gate
+            thr_abs = Z_GATE_BY_ASSET.get(s.asset, Z_GATE) * sd_S         # margin to clear it (display)
             if not s.decided and C.SEC_LO <= sec <= C.TAU_DECISION:
                 s.decided = True
                 s.bet_yes = margin > 0
                 s.decision_margin = margin
                 s.sd_S = sd_S
                 s.p_side = p_side
-                s.gate_active = p_side >= C.P_SIDE_MIN
+                s.gate_active = p_side >= gate_min
                 self.store.event("decision",
                     f"{s.ticker} [{s.asset}] sec={sec:.0f} margin={margin:+.1f} "
                     f"sd={sd_S:.1f} p_side={p_side:.4f} bet={'YES' if s.bet_yes else 'NO'} "
@@ -191,6 +213,8 @@ class Engine:
                 self.log(f"DECISION {s.ticker} [{s.asset}] margin={margin:+.1f} "
                          f"sd={sd_S:.1f} p_side={p_side:.4f} bet={'YES' if s.bet_yes else 'NO'} "
                          f"gate={'ON' if s.gate_active else 'off'}")
+                if self.live is not None and s.gate_active:
+                    self.live.on_decision(s, sec)   # rest the real maker bid
             b = s.book
             byb, bnb = b.best_yes_bid(), b.best_no_bid()
             self.store.book(s.ticker, sec, byb, b.yes.get(byb, 0.0) if byb else 0.0,
@@ -242,8 +266,11 @@ class Engine:
         fees = sum(f for _, _, f in s.fills)   # f is per-ORDER total maker fee
         gross = payout - s.window_cost
         net = gross - fees
-        self.cash += payout - fees
         self.realized += net
+        if self.live is not None:
+            self.cash = self.live.note_settle(s.ticker, net)   # reconcile REAL balance
+        else:
+            self.cash += payout - fees
         avg_px = (sum(p * q for p, q, _ in s.fills) / s.total_qty) if s.total_qty else None
         self.store.window((s.ticker, s.asset, s.series, s.close_ts, s.strike, true_settle,
                            result, s.decision_margin,

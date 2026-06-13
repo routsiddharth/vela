@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS windows(
 CREATE TABLE IF NOT EXISTS debias(
   ticker TEXT PRIMARY KEY, asset TEXT, close_ts INTEGER, binance_avg60 REAL,
   true_settle REAL, err REAL);
+CREATE TABLE IF NOT EXISTS orders(
+  ts_ms INTEGER, ticker TEXT, action TEXT, client_order_id TEXT, order_id TEXT,
+  side TEXT, price REAL, count INTEGER, status TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS events(ts_ms INTEGER, kind TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS ix_book ON book_snaps(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_est ON estimates(ticker, ts_ms);
@@ -124,6 +127,12 @@ class Store:
     def debias_row(self, ticker, asset, close_ts, b60, settle, err) -> None:
         self._w("INSERT OR REPLACE INTO debias VALUES(?,?,?,?,?,?)",
                 (ticker, asset, close_ts, b60, settle, err), commit=True)
+
+    def order(self, ticker, action, client_order_id, order_id, side, price,
+              count, status, detail="") -> None:
+        self._w("INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (now_ms(), ticker, action, client_order_id, order_id, side, price,
+                 count, status, detail), commit=True)
 
     def event(self, kind: str, detail: str = "") -> None:
         self._w("INSERT INTO events VALUES(?,?,?)", (now_ms(), kind, detail), commit=True)

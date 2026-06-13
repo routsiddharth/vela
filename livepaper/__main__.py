@@ -47,7 +47,8 @@ async def main() -> None:
     log = make_logger()
     log("=== livepaper starting — multi-market TWAP panic-fade ===")
     log(f"markets={[m['series'] for m in C.MARKETS]} bankroll=${C.BANKROLL:.0f} "
-        f"p_side>={C.P_SIDE_MIN} px=[{C.WIN_PX_FLOOR},{C.CAP}] window=[{C.SEC_LO},{C.SEC_HI}]s "
+        f"p_side>={C.P_SIDE_MIN_BY_ASSET} (default {C.P_SIDE_MIN}) "
+        f"px=[{C.WIN_PX_FLOOR},{C.CAP}] window=[{C.SEC_LO},{C.SEC_HI}]s "
         f"sizing={C.PORTFOLIO_FRACTION:.0%}-of-portfolio/trade(round-up) "
         f"maker_fee={C.MAKER_FEE_RATE}")
 
@@ -106,6 +107,8 @@ async def main() -> None:
     ]
     await stop.wait()
     log("shutting down — flushing store...")
+    if engine.live is not None:
+        engine.live.shutdown()      # cancel all resting REAL orders before exit
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
