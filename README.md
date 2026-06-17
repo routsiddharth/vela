@@ -6,10 +6,6 @@
 feeds), then rides the gap between what's already decided and what the crowd is
 still pricing.*
 
-This is a **paper-trading research project**: the engine watches live Kalshi order
-books and trades and books *theoretical* fills against a $50 paper bankroll. It
-**never places a real order.**
-
 ---
 
 ## The idea
@@ -28,10 +24,10 @@ already drowned that tick out, so that side still pays $1.
 **Vela's edge is fading that panic:**
 1. Reconstruct the settling 60s average in real time from free **Binance 1s**
    prices, with a **causal Binance→RTI de-bias** (Binance runs a stable ~0.035%
-   premium vs the CF index — see `backtest/analysis/drift_test.py`).
+   premium vs the CF index).
 2. At ~45s to close, **lock the bet** on the favored side — but only if the model's
    `p_side = P(our side wins | its own uncertainty)` clears a confidence gate.
-3. Over the final seconds, **buy that side only at a genuine discount** (a price
+3. Over the final seconds, **buy that side only at a genuine discount** (price
    floor/cap), holding to settlement.
 
 It is arithmetic and patience, not prediction. Full thesis: [`STRATEGY.md`](STRATEGY.md).
@@ -40,8 +36,7 @@ It is arithmetic and patience, not prediction. Full thesis: [`STRATEGY.md`](STRA
 
 ## The markets
 
-All settle to the **mean of 60 RTI samples over the final 60s** (confirmed from
-every series' `rules_primary`). They differ only in the strike:
+All settle to the **mean of 60 RTI samples over the final 60s**. They differ only in the strike:
 
 | Series | Question | Strike | Window | Index / proxy |
 |--------|----------|--------|--------|---------------|
@@ -51,12 +46,25 @@ every series' `rules_primary`). They differ only in the strike:
 | `KXETHD`   | above $X at the hour | fixed ladder (`greater`) | 1 hour | ERTI / ETHUSDT |
 
 Prices are in dollars (0.01–0.99); a YES contract pays $1. The two-sided "range"
-series (`KXBTC`/`KXETH`) are intentionally excluded — their two-boundary margin
-doesn't fit the single-margin model.
+series (`KXBTC`/`KXETH`) are excluded — their two-boundary margin doesn't fit the
+single-margin model.
 
-**Fees matter and are modeled exactly.** Taker = `ceil_cent(0.07·p·(1−p))` (min 1¢);
-maker = `ceil_cent(0.0175·qty·p·(1−p))` per order. Both peak near p=0.50 (~1.75¢/ct
-taker) — trading the coin-flip is expensive, so the edge lives in the tails.
+**Fees matter and are modeled exactly.** Taker = `ceil_cent(0.07·p·(1−p))`; maker =
+`ceil_cent(0.0175·qty·p·(1−p))` per order. Both peak near p=0.50 — the edge lives
+in the tails where fees are lowest.
+
+---
+
+## Three live trading pathways
+
+| # | Name | Mechanism | Markets | Gate |
+|---|------|-----------|---------|------|
+| 1 | BTC panic-fade | maker limit bid at decision (~45s to close) | KXBTC15M + KXBTCD | p_side ≥ 0.84 |
+| 2 | BTC strong-take | taker buy when ask ≥ 0.95 within [2s, 45s) | KXBTC15M only | none (price gate only) |
+| 3 | ETH panic-fade | same as BTC panic-fade, stricter gate | KXETH15M + KXETHD | p_side ≥ 0.98 |
+
+All three run concurrently on the same Kalshi account. BTC and ETH bots are separate
+processes with independent kill-switches and daily-loss halts.
 
 ---
 
@@ -64,93 +72,62 @@ taker) — trading the coin-flip is expensive, so the edge lives in the tails.
 
 ```
 vela/
-├── livepaper/          the live paper-trading engine (read-only)
+├── livepaper/
 │   ├── feeds.py        Binance multi-symbol 1s WS + Kalshi authed WS (book/trade/lifecycle)
 │   ├── market.py       order book, per-market state, REST discovery, per-asset de-bias
-│   ├── engine.py       per-sec estimate + p_side gate + trade-driven paper fills + settlement
-│   ├── store.py        SQLite (WAL) + raw JSONL firehose
-│   ├── config.py       ALL strategy params live here (gate, floor/cap, sizing, fees)
-│   ├── report.py       PnL / win-rate / balance summary  (python -m livepaper.report)
-│   └── data/           paper.db, raw_*.jsonl, run.log   ← the live dataset
-├── backtest/           historical data + analysis (data/, analysis/, findings/)
-├── testing/            earlier research notebooks/sims
-└── STRATEGY.md         the high-level strategy write-up
+│   ├── engine.py       per-sec estimate + p_side gate + fill logic + settlement
+│   ├── live_exec.py    real Kalshi order lifecycle (place, poll fills, cancel, halt)
+│   ├── broker.py       LiveBroker (Kalshi REST) + MockBroker (tests)
+│   ├── store.py        SQLite (WAL)
+│   ├── config.py       all strategy params + live trading flags
+│   ├── report.py       PnL / win-rate summary  (python -m livepaper.report)
+│   ├── data_btc/       BTC bot data: paper.db, run.log
+│   └── data_eth/       ETH bot data: paper.db, run.log
+├── backtest/           historical data + analysis
+└── STRATEGY.md         strategy write-up
 ```
 
-How the engine works each second, per tracked market: pull the asset's Binance feed
-→ compute the de-biased TWAP margin and `p_side` → at 45s lock the bet if
-`p_side ≥ P_SIDE_MIN` → while in the fill window, book a paper fill on any
-winning-side print in `[WIN_PX_FLOOR, CAP]` → on settlement, realize PnL, update the
-$50 balance, and fold the realized Binance−RTI error back into that asset's de-bias.
-Everything is logged second-by-second.
-
-Strategy knobs (in `config.py`): `P_SIDE_MIN` (confidence gate), `WIN_PX_FLOOR` /
-`CAP` (discount band), `MIN_WINDOW_NOTIONAL` / `PORTFOLIO_FRACTION` (sizing),
-`TAU_DECISION`, `SEC_LO/HI`, `MARKETS`.
+Each second per tracked market: pull Binance feed → compute de-biased TWAP margin
+and `p_side` → at 45s lock the bet if gate passes → place real maker limit bid →
+poll fills → cancel unfilled at 2s → on settlement, realize PnL and update de-bias.
 
 ---
 
-## What we've learned (the honest part)
+## Run
 
-This is research, and the research says the easy money isn't here. Key findings
-(full write-ups in `backtest/findings/`):
-
-- **Six genuinely distinct strategies were tested and all make ≈ $0/day after
-  fees** — directional, market-making, cross-strike ladder arbitrage,
-  favorite-longshot, order-flow imbalance, and a grab-bag of time-of-day /
-  round-number / lead-lag ideas. The market is efficient to every public signal and
-  the fee is a wall at the coin-flip. (`EXPLORE_SYNTHESIS.md`)
-- **The panic-fade is the one approach with a real edge — but it's tiny and
-  capacity-bound:** ~$0.2–1.6/day on a $50 bankroll in backtest, *not* the $5/day
-  one might hope for. More size is leverage, not alpha.
-- **The EV truth:** for a binary, `EV/contract = win_rate − price`. Live, fills
-  cluster at high prices (0.97–0.99) where a win is worth ~1¢ against a ~$5
-  downside, so even a ~97% win rate barely covers the losses — **roughly
-  break-even.** The genuine edge is in the *rarer, cheaper* fills; `CAP` is the knob
-  that trades fill-frequency against per-fill margin.
-- **Best swarm-optimized config** (`opt_*.md`): `P_SIDE_MIN≈0.84, WIN_PX_FLOOR=0.45`
-  — ~4× the edge of the conservative gate, but it takes real ~$5 losing windows
-  (96.6% win, not 100%). The 0.95–0.97 region is a trap (out-of-sample reverses
-  sign under a flipped train/test split).
-
-**Status:** a long-lived live paper experiment is running in `livepaper/data/` to
-measure the realized win rate vs. entry price over time. Honest expectation is
-~break-even; the deliverable is the dataset and the execution learnings, not income.
-
----
-
-## Run / inspect
-
-The live engine needs `websockets httpx certifi cryptography python-dotenv`;
-backtests also need `pandas numpy scipy pyarrow`. Auth lives in `.env`
-(`KALSHI_API_KEY` + `KALSHI_API_SECRET`; Binance market data needs no key).
+Requires `websockets httpx certifi cryptography python-dotenv`. Auth in `.env`
+(`KALSHI_API_KEY` + `KALSHI_API_SECRET`).
 
 ```bash
-cd vela
-python3 -m venv venv && source venv/bin/activate
-pip install websockets httpx certifi cryptography python-dotenv pandas numpy scipy pyarrow
+# BTC bot — panic-fade + strong-take, live
+VELA_ASSET=BTC VELA_LIVE=1 VELA_STRONG_TAKE=1 ./run_btc.sh
 
-python -m livepaper            # start the engine (read-only; Ctrl-C to stop)
-python -m livepaper.report     # PnL / win-rate / balance  (safe while running)
-tail -f livepaper/data/run.log # live decisions & settlements
+# ETH bot — panic-fade only, live, tighter stop
+VELA_ASSET=ETH VELA_LIVE=1 VELA_POSITION_USD=5 VELA_MAX_DAILY_LOSS=15 VELA_MAX_OPEN_NOTIONAL=15 ./run_eth.sh
 
-# backtests / analysis
-python -m backtest.analysis.opt_harness        # parameter evaluator (OOS-aware)
-python -m backtest.analysis.leniency_sweep     # gate × cap frontier
-python -m backtest.analysis.drift_test ETH     # Binance-vs-RTI drift for an asset
+# inspect
+python -m livepaper.report
+tail -f livepaper/data_btc/run.log   # fills + PnL only
 ```
 
-**The data:** `livepaper/data/paper.db` (SQLite, WAL — query live with `sqlite3`)
-holds `prices`, `book_snaps`, `estimates`, `trades`, `fills`, `windows`, `debias`,
-`events`. `raw_kalshi.jsonl` / `raw_binance.jsonl` are the full message firehose.
+**Kill switches** (cancel all open orders + halt immediately):
+```bash
+touch livepaper/data_btc/KILL
+touch livepaper/data_eth/KILL
+```
+
+**Data:** `paper.db` (SQLite, WAL) holds `prices`, `book_snaps`, `estimates`,
+`trades`, `fills`, `windows`, `debias`, `events`. Safe to query while running.
 
 ---
 
-## Invariants
+## Key config (`livepaper/config.py`)
 
-- **Read-only.** The engine subscribes to market data and books paper fills; it
-  never sends an order. Keep it that way until explicitly going live.
-- **Behavior is configured in `config.py`, not scattered.** Secrets are the only
-  thing in `.env`, never committed.
-- **The watch metric is the realized win rate vs. average entry price** — not the
-  realized $. You're positive only while `win% ≥ avg entry price`.
+| Param | Value | Meaning |
+|-------|-------|---------|
+| `P_SIDE_MIN_BY_ASSET` | BTC: 0.84, ETH: 0.98 | per-asset confidence gate |
+| `WIN_PX_FLOOR` / `CAP` | 0.45 / 0.99 | only fade genuine panic, not deep OTM |
+| `POSITION_USD` | $5 | fixed notional per window (`VELA_POSITION_USD` to override) |
+| `LIVE_MAX_DAILY_LOSS` | $25 BTC / $15 ETH | per-bot stop-loss (`VELA_MAX_DAILY_LOSS`) |
+| `STRONG_TAKE_THRESH` | 0.95 | taker pathway fires when ask ≥ this |
+| `RAW_DUMP` | True | writes raw Kalshi WS messages to disk (large; set False to disable) |

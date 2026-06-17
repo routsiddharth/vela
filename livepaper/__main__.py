@@ -45,12 +45,7 @@ async def periodic(fn, every: float, stop: asyncio.Event, in_thread=False):
 async def main() -> None:
     store = Store()
     log = make_logger()
-    log("=== livepaper starting — multi-market TWAP panic-fade ===")
-    log(f"markets={[m['series'] for m in C.MARKETS]} bankroll=${C.BANKROLL:.0f} "
-        f"p_side>={C.P_SIDE_MIN_BY_ASSET} (default {C.P_SIDE_MIN}) "
-        f"px=[{C.WIN_PX_FLOOR},{C.CAP}] window=[{C.SEC_LO},{C.SEC_HI}]s "
-        f"sizing={C.PORTFOLIO_FRACTION:.0%}-of-portfolio/trade(round-up) "
-        f"maker_fee={C.MAKER_FEE_RATE}")
+    log(f"=== livepaper starting asset={C.ASSET or 'ALL'} live={C.LIVE} strong={C.STRONG_TAKE} ===")
 
     kalshi = Kalshi()
     disc = Discovery(kalshi)
@@ -89,30 +84,20 @@ async def main() -> None:
         ws.set_desired(engine.sync_markets(actives))
     await asyncio.to_thread(discover)
 
-    def status():
-        n_open = sum(1 for s in engine.states.values() if not s.settled)
-        deltas = " ".join(f"{a}=${db.delta():.2f}" for a, db in debias.items())
-        prices = " ".join(f"{sym}={feed.latest(sym)[1] if feed.latest(sym) else '?'}"
-                          for sym in C.ASSET_SYMBOL.values())
-        log(f"status bal=${engine.cash:.2f} realized=${engine.realized:+.3f} "
-            f"tracking={n_open} trades_seen={engine.n_trades} | delta[{deltas}] | {prices}")
-
     tasks = [
         asyncio.create_task(feed.run(stop), name="binance"),
         asyncio.create_task(ws.run(stop), name="kalshi"),
         asyncio.create_task(periodic(discover, C.DISCOVERY_EVERY, stop, in_thread=True), name="discover"),
         asyncio.create_task(periodic(engine.tick, C.TICK, stop), name="tick"),
         asyncio.create_task(periodic(engine.settle_closed, C.SETTLE_POLL_EVERY, stop, in_thread=True), name="settle"),
-        asyncio.create_task(periodic(status, 60.0, stop), name="status"),
     ]
     await stop.wait()
-    log("shutting down — flushing store...")
     if engine.live is not None:
         engine.live.shutdown()      # cancel all resting REAL orders before exit
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    store.flush(); status(); store.close()
+    store.flush(); store.close()
     log(f"=== stopped. final balance ${engine.cash:.2f} (realized ${engine.realized:+.3f}) ===")
 
 

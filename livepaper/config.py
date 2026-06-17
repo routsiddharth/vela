@@ -20,6 +20,16 @@ from pathlib import Path
 # Unset => legacy combined run in data/ (both assets, one shared bankroll).
 ASSET = os.environ.get("VELA_ASSET", "").upper() or None
 
+
+def _envf(name: str, default: float) -> float:
+    """Per-process float override from env (empty/unset/bad => default). Lets each
+    asset's bot run with its OWN budget/stop-loss without a shared config edit."""
+    v = os.environ.get(name, "")
+    try:
+        return float(v) if v != "" else default
+    except ValueError:
+        return default
+
 # ---- where data lands -------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / (f"data_{ASSET.lower()}" if ASSET else "data")
@@ -121,17 +131,35 @@ MAX_WINDOW_NOTIONAL = 1_000_000.0   # absolute hard ceiling only; live size = 10
 # 10%-compounding). Guarded by a kill switch + daily-loss halt. See live_exec.py.
 LIVE = os.environ.get("VELA_LIVE", "") == "1"
 LIVE_DEMO = os.environ.get("VELA_LIVE_DEMO", "") == "1"   # use Kalshi demo cluster
-POSITION_USD = 5.0              # fixed notional per window (contracts = round(5/price))
+POSITION_USD = _envf("VELA_POSITION_USD", 5.0)   # fixed notional/window (env-overridable per bot)
 LIVE_REST_FLOOR = WIN_PX_FLOOR  # never rest a buy below this (adverse-selection guard)
 LIVE_REST_CAP = CAP             # never rest a buy above this (no-discount guard)
 # resting price: join the favored side's best bid (be the maker a panic seller hits),
 # clamped to [floor, cap]. The one real execution knob — tune after seeing fill rate.
 LIVE_JOIN_BEST_BID = True
 # risk guards
-LIVE_MAX_DAILY_LOSS = 25.0      # halt + cancel-all once realized PnL for the day <= -this
-LIVE_MAX_OPEN_NOTIONAL = 25.0   # cap total resting+open exposure at any moment
+LIVE_MAX_DAILY_LOSS = _envf("VELA_MAX_DAILY_LOSS", 25.0)      # stop-loss: halt + cancel-all at this day loss (per bot)
+LIVE_MAX_OPEN_NOTIONAL = _envf("VELA_MAX_OPEN_NOTIONAL", 25.0)  # cap total resting+open exposure (per bot)
 LIVE_KILL_FILE = "KILL"         # presence of this file in the data dir => cancel-all + halt
 LIVE_CANCEL_BEFORE_CLOSE = 2    # cancel any unfilled remainder at sec_to_close <= this
+
+# ---- ALT pathway: "strong take" (taker on near-certain favorites) -----------
+# A SECOND, INDEPENDENT live pathway that runs ALONGSIDE the panic-fade (it does
+# NOT replace or disable it). When VELA_STRONG_TAKE=1, on STRONG_SERIES only: if a
+# side's ASK >= STRONG_TAKE_THRESH while STRONG_TAKE_SEC_LO <= sec_to_close <
+# STRONG_TAKE_SEC_HI, send ONE *taker* buy on that side (crossing the spread, up to
+# STRONG_MAX_PX), POSITION_USD notional, hold to settlement. Ignores p_side
+# entirely. Its book is kept SEPARATE from the panic-fade's per-window MarketState
+# accounting (so it can't corrupt it), but it shares the SAME real account and the
+# SAME kill-switch / daily-loss / open-notional guards. Off => totally inert, so
+# the ETH bot and any default run are unaffected. Modeled (14h, KXBTC15M): ~+2.4c/ct.
+STRONG_TAKE = os.environ.get("VELA_STRONG_TAKE", "") == "1"
+STRONG_SERIES = {"KXBTC15M"}    # 15-min ATM only (the branch that modeled positive)
+STRONG_TAKE_THRESH = 0.95       # take a side once its ask reaches this
+STRONG_MAX_PX = 0.99            # never pay more than this to take (>=1.00 can't profit)
+STRONG_TAKE_SEC_HI = 45.0       # only act while sec_to_close < this (the "<45s" rule)
+STRONG_TAKE_SEC_LO = 2.0        # ...and >= this (leave room for the taker fill to land)
+STRONG_TAKER_FEE_RATE = 0.07    # taker fee (crossing); only a fallback if the fill omits fee_cost
 
 # ---- de-bias (causal Binance->RTI) ------------------------------------------
 DEBIAS_LOOKBACK = 96            # trailing windows (~24h of 15M) for the median bias

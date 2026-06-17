@@ -140,7 +140,6 @@ class KalshiWS:
                                       "params": {"channels": [chan],
                                                  "market_tickers": [ticker]}}))
         self._subscribed.add(ticker)
-        self.log(f"kalshi subscribed {ticker}")
 
     async def run(self, stop: asyncio.Event) -> None:
         backoff = 1.0

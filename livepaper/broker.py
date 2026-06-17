@@ -128,6 +128,23 @@ class LiveBroker:
         }
         return self._req("POST", "/portfolio/orders", body=body).get("order", {})
 
+    def place_taker_buy(self, ticker: str, side: str, price_dollars: float,
+                        count: int, client_order_id: str) -> dict:
+        """Cross the spread: a marketable limit buy (NOT post_only) that TAKES
+        liquidity up to price_dollars and pays the taker fee. side='yes'|'no'.
+        Used by the 'strong take' pathway; the panic-fade still uses the
+        post_only place_limit_buy above."""
+        body = {
+            "ticker": ticker,
+            "client_order_id": client_order_id,
+            "action": "buy",
+            "side": side,
+            "type": "limit",
+            "count": int(count),
+            f"{side}_price": px_cents(price_dollars),  # limit price; no post_only -> may cross
+        }
+        return self._req("POST", "/portfolio/orders", body=body).get("order", {})
+
     def cancel(self, order_id: str) -> dict:
         return self._req("DELETE", f"/portfolio/orders/{order_id}")
 
@@ -180,6 +197,11 @@ class MockBroker:
         self._orders[oid] = o
         return dict(o)
 
+    # taker buy: same bookkeeping as a resting order here (tests drive fills
+    # explicitly via fill_order); the real broker differs only in post_only.
+    def place_taker_buy(self, ticker, side, price_dollars, count, client_order_id):
+        return self.place_limit_buy(ticker, side, price_dollars, count, client_order_id)
+
     def cancel(self, order_id):
         o = self._orders.get(order_id)
         if o and o["status"] == "resting":
@@ -194,6 +216,9 @@ class MockBroker:
         return n
 
     # ---- test hook: simulate a (partial) maker fill on a resting order ----
+    # Emits the SAME field names the REAL Kalshi /portfolio/fills returns
+    # (count_fp, {yes,no}_price_dollars, fee_cost, trade_id, ticker) so tests
+    # exercise the real parser. (A prior mismatch here hid a live fill-parse bug.)
     def fill_order(self, order_id: str, count: int, fee: float = 0.0) -> dict:
         o = self._orders[order_id]
         count = min(count, o["remaining_count"])
@@ -202,9 +227,12 @@ class MockBroker:
             o["status"] = "executed"
         cost = count * o["price"]
         self._bal -= (cost + fee)
-        f = {"trade_id": f"t{len(self._fills)+1}", "order_id": order_id,
-             "ticker": o["ticker"], "side": o["side"], "count": count,
-             "price": o["price"], "fee": fee}
+        side = o["side"]
+        f = {"trade_id": f"t{len(self._fills)+1}", "fill_id": f"t{len(self._fills)+1}",
+             "order_id": order_id, "ticker": o["ticker"], "market_ticker": o["ticker"],
+             "side": side, "count_fp": f"{count:.2f}", "fee_cost": f"{fee:.6f}",
+             f"{side}_price_dollars": f"{o['price']:.4f}",
+             f"{'yes' if side=='no' else 'no'}_price_dollars": f"{1.0 - o['price']:.4f}"}
         self._fills.append(f)
         return f
 

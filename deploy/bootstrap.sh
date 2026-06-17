@@ -43,6 +43,7 @@ Wants=network-online.target
 WorkingDirectory=$REPO
 Environment=VELA_ASSET=BTC
 Environment=VELA_LIVE=1
+Environment=VELA_STRONG_TAKE=1
 ExecStart=$REPO/venv/bin/python -m livepaper
 Restart=on-failure
 RestartSec=5

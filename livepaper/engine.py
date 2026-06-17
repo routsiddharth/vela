@@ -99,7 +99,6 @@ class Engine:
                     a["asset"], a["symbol"], a["series"])
                 self.store.event("market_open",
                                  f"{a['ticker']} {a['asset']} close={a['close_ts']} strike={a['strike']}")
-                self.log(f"tracking {a['ticker']} [{a['asset']}] strike={a['strike']:.2f}")
         return {tk for tk, s in self.states.items() if not s.settled}
 
     # ---- WS callbacks -------------------------------------------------------
@@ -210,9 +209,6 @@ class Engine:
                     f"{s.ticker} [{s.asset}] sec={sec:.0f} margin={margin:+.1f} "
                     f"sd={sd_S:.1f} p_side={p_side:.4f} bet={'YES' if s.bet_yes else 'NO'} "
                     f"gate={'ON' if s.gate_active else 'off'}")
-                self.log(f"DECISION {s.ticker} [{s.asset}] margin={margin:+.1f} "
-                         f"sd={sd_S:.1f} p_side={p_side:.4f} bet={'YES' if s.bet_yes else 'NO'} "
-                         f"gate={'ON' if s.gate_active else 'off'}")
                 if self.live is not None and s.gate_active:
                     self.live.on_decision(s, sec)   # rest the real maker bid
             b = s.book
@@ -225,6 +221,8 @@ class Engine:
                                 mhat, s.strike, margin, thr_abs,
                                 ("yes" if s.bet_yes else "no") if s.decided else None,
                                 s.gate_active, s.decided)
+            if self.live is not None:
+                self.live.consider_take(s, sec, now)   # ALT pathway (no-op unless STRONG_TAKE)
 
     def _estimate(self, s: MarketState, now: float, spot: float, delta: float):
         start = s.close_ts - C.SETTLE_SECS
@@ -269,6 +267,7 @@ class Engine:
         self.realized += net
         if self.live is not None:
             self.cash = self.live.note_settle(s.ticker, net)   # reconcile REAL balance
+            self.live.settle_strong(s.ticker, result, time.time())  # ALT pathway book
         else:
             self.cash += payout - fees
         avg_px = (sum(p * q for p, q, _ in s.fills) / s.total_qty) if s.total_qty else None
@@ -292,7 +291,6 @@ class Engine:
             why = ("gate off" if (s.decided and not s.gate_active)
                    else "no decision" if not s.decided else "no panic print<=CAP")
             self.store.event("settled_notrade", f"{s.ticker} {result} ({why})")
-            self.log(f"SETTLED {s.ticker} [{s.asset}] {result.upper()} no-trade ({why})")
 
     def _local_avg60(self, symbol: str, close_ts: int):
         ps = [self.feed.price_at(symbol, e) for e in range(close_ts - C.SETTLE_SECS, close_ts)]

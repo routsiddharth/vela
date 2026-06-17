@@ -54,10 +54,12 @@ Wants=network-online.target
 WorkingDirectory=/home/ubuntu/vela
 Environment=VELA_ASSET=BTC
 Environment=VELA_LIVE=1
+Environment=VELA_STRONG_TAKE=1
 ExecStart=/home/ubuntu/vela/venv/bin/python -m livepaper
 Restart=on-failure
 RestartSec=5
 # auto-restart is safe: startup_reconcile() cancels any stray orders first
+# (drop the VELA_STRONG_TAKE line to run the panic-fade only)
 
 [Install]
 WantedBy=multi-user.target
