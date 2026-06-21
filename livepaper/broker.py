@@ -32,10 +32,31 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 
+# v2 create-order endpoint. The legacy POST /portfolio/orders (action+side(yes|no)+
+# {yes,no}_price in cents) was deprecated 2026-06 -> HTTP 410 deprecated_v1_order_endpoint.
+# v2 quotes EVERYTHING from the YES leg: side is bid|ask, price is a fixed-point DOLLAR
+# string always in YES terms, count is a string. buy YES == bid at yes_price; buy NO ==
+# ask at (1 - no_price) (selling YES is economically buying NO).
+ORDERS_PATH_V2 = "/portfolio/events/orders"
+
 
 def px_cents(price_dollars: float) -> int:
     """Dollars (0.01..0.99) -> Kalshi integer cents (1..99), clamped."""
     return max(1, min(99, round(price_dollars * 100)))
+
+
+def _yes_price_dollars(price_dollars: float) -> str:
+    """Clamp to a valid 1c..99c tick and format as a fixed-point dollar string."""
+    p = max(0.01, min(0.99, round(price_dollars, 2)))
+    return f"{p:.2f}"
+
+
+def _yes_terms(side: str, price_dollars: float) -> tuple[str, str]:
+    """Map our (side, side-price) onto the v2 YES-quoted book.
+    side='yes' -> ('bid', yes_price); side='no' -> ('ask', 1 - no_price)."""
+    if side == "yes":
+        return "bid", _yes_price_dollars(price_dollars)
+    return "ask", _yes_price_dollars(1.0 - price_dollars)
 
 
 def new_client_order_id() -> str:
@@ -112,38 +133,41 @@ class LiveBroker:
             p["min_ts"] = min_ts
         return self._req("GET", "/portfolio/fills", params=p).get("fills", [])
 
-    # ---- order actions (post_only -> maker only) ----
+    # ---- order actions (v2 create endpoint; post_only -> maker only) ----
     def place_limit_buy(self, ticker: str, side: str, price_dollars: float,
                         count: int, client_order_id: str) -> dict:
         """Rest a MAKER limit buy. side='yes'|'no'. Returns the order dict."""
+        v2_side, yes_px = _yes_terms(side, price_dollars)
         body = {
             "ticker": ticker,
             "client_order_id": client_order_id,
-            "action": "buy",
-            "side": side,
-            "type": "limit",
-            "count": int(count),
-            "post_only": True,                       # reject if it would cross -> maker only
-            f"{side}_price": px_cents(price_dollars),  # yes_price or no_price, in cents
+            "side": v2_side,                          # bid=buy YES, ask=buy NO
+            "count": str(int(count)),
+            "price": yes_px,                          # fixed-point dollars, YES terms
+            "time_in_force": "good_till_canceled",
+            "post_only": True,                        # reject if it would cross -> maker only
+            "self_trade_prevention_type": "maker",
         }
-        return self._req("POST", "/portfolio/orders", body=body).get("order", {})
+        r = self._req("POST", ORDERS_PATH_V2, body=body)
+        return r.get("order", r)                      # v2 returns order fields at top level
 
     def place_taker_buy(self, ticker: str, side: str, price_dollars: float,
                         count: int, client_order_id: str) -> dict:
-        """Cross the spread: a marketable limit buy (NOT post_only) that TAKES
-        liquidity up to price_dollars and pays the taker fee. side='yes'|'no'.
-        Used by the 'strong take' pathway; the panic-fade still uses the
-        post_only place_limit_buy above."""
+        """Cross the spread: an immediate-or-cancel limit buy that TAKES liquidity up
+        to price_dollars and pays the taker fee. side='yes'|'no'. Used by the 'strong
+        take' pathway; the panic-fade still uses the post_only place_limit_buy above."""
+        v2_side, yes_px = _yes_terms(side, price_dollars)
         body = {
             "ticker": ticker,
             "client_order_id": client_order_id,
-            "action": "buy",
-            "side": side,
-            "type": "limit",
-            "count": int(count),
-            f"{side}_price": px_cents(price_dollars),  # limit price; no post_only -> may cross
+            "side": v2_side,
+            "count": str(int(count)),
+            "price": yes_px,                          # limit price; IOC -> may cross then cancel
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        return self._req("POST", "/portfolio/orders", body=body).get("order", {})
+        r = self._req("POST", ORDERS_PATH_V2, body=body)
+        return r.get("order", r)
 
     def cancel(self, order_id: str) -> dict:
         return self._req("DELETE", f"/portfolio/orders/{order_id}")

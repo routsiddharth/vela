@@ -181,7 +181,58 @@ tiny sample (11–16 windows); this is the live measurement that matters.
 
 ---
 
-## Current live configuration (2026-06-17)
+### v5 — Dynamic 10% sizing + Kalshi v2 order endpoint (2026-06-17 → 2026-06-20)
+
+**5a — Live sizing: fixed $5 → 10% of a shared risk ledger (~2026-06-17)**
+
+**What:** Replaced the per-window fixed `$5` notional with `PORTFOLIO_FRACTION = 0.10`
+of a shared live **risk ledger** (`data_shared/portfolio.db`, reset to $50.00 on
+2026-06-17). Every live order — both panic-fade and strong-take, across both bots —
+is now `round(0.10 × ledger_balance / price)` contracts, **minimum 1 contract**. The
+ledger is shared by the BTC and ETH bots and updated on every settled live window, so
+position size **compounds** with realized PnL. There is **no $5 floor on the live
+path**; `MIN_WINDOW_NOTIONAL = 5.0` now applies ONLY to the paper sim in `engine.py`.
+Implemented in `live_exec.py` (`_target_notional` / `_count_for_price`).
+
+**Why:** A fixed $5 doesn't scale with the account. Sizing as a fraction of one
+shared risk balance lets both pathways and both bots draw from a single compounding
+risk pool that grows/shrinks with results. (No backtest in the records motivates this
+beyond compounding + a single shared risk pool — logged here as a change of record,
+since the prior `$5` was never updated in this file.)
+
+**Result:** Live orders size at 10% — e.g. at a $52.41 ledger the 2026-06-20 08:00
+BTC window placed 7 ct @ $0.77 (above-63600, YES) and 5 ct @ $0.99 (above-63700, NO),
+each ≈ $5.2 target. Both won, +$1.66.
+
+**5b — Migrated order placement to Kalshi's v2 create-order endpoint (2026-06-20)**
+
+**What:** Kalshi deprecated the legacy v1 `POST /portfolio/orders` (action + side
+`yes|no` + `{yes,no}_price` in cents); it began returning **HTTP 410
+`deprecated_v1_order_endpoint`**. Rewrote `place_limit_buy` / `place_taker_buy` in
+`broker.py` to the v2 endpoint **`POST /portfolio/events/orders`**, which quotes
+everything from the YES leg: `side: bid` = buy YES, `side: ask` = buy NO (at YES price
+`1 − no_price`); `price` is a fixed-point **dollar** string, `count` a string;
+`time_in_force = good_till_canceled` + `post_only` for the maker fade,
+`immediate_or_cancel` for the strong-take taker; `self_trade_prevention_type` is now
+required. GET/DELETE (balance, positions, fills, resting orders, cancel) were
+unaffected and left unchanged.
+
+**Why:** Every live order silently failed with 410 from **2026-06-18 21:45 →
+2026-06-20 07:56 UTC**. Both bots stayed connected and kept evaluating windows (gate
+firing every window), but placed zero orders — so **2026-06-19 realized exactly $0**
+across 229 settlements. The 410s went to the `events` table but not to the fills-only
+`run.log`, so the bots looked alive while being functionally halted.
+
+**Result (live):** Verified on production with a non-fillable place+cancel on both
+the YES (`bid`) and NO (`ask`) legs before restart (mapping confirmed:
+`outcome_side` yes/no correct). First post-fix window (06-20 08:00) filled and won
+(+$1.66). **2026-06-20 closed +$4.34 — the best day in the live run** (BTC fade
++$2.71, strong-take +$1.10, ETH fade +$0.53) vs the $0.00 outage day before.
+Cumulative live realized **+$7.17** as of 2026-06-21; zero losing settlements to date.
+
+---
+
+## Current live configuration (2026-06-21)
 
 | Param | BTC | ETH | Notes |
 |-------|-----|-----|-------|
@@ -190,7 +241,7 @@ tiny sample (11–16 windows); this is the live measurement that matters.
 | `CAP` | 0.99 | 0.99 | genuine-discount cap |
 | `TAU_DECISION` | 45s | 45s | lock point |
 | `SEC_LO / SEC_HI` | 1 / 45 | 1 / 45 | fill window |
-| `POSITION_USD` | $5 | $5 | fixed notional/window |
+| Live sizing | 10% of risk ledger | 10% of risk ledger | `0.10 × data_shared` balance, min 1 ct, compounds (v5) |
 | `LIVE_MAX_DAILY_LOSS` | $25 | $15 | per-bot halt |
 | `LIVE_MAX_OPEN_NOTIONAL` | $25 | $15 | per-bot cap |
 | Strong-take | ON (0.95 threshold, KXBTC15M) | OFF | separate pathway |
