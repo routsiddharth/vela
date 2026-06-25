@@ -87,8 +87,9 @@ class Engine:
             self.live.attach(self.states)
             self.live.startup_reconcile()
             if self.live.balance is not None:
-                self.cash = self.live.balance     # start accounting from REAL balance
-            self.log(f"[live] LIVE TRADING ENABLED — real orders, ${C.POSITION_USD}/window")
+                self.cash = self.live.balance     # start accounting from shared risk ledger
+            self.log(f"[live] LIVE TRADING ENABLED — real orders, "
+                     f"{C.PORTFOLIO_FRACTION:.0%} of shared risk balance/window")
 
     # ---- discovery hook -----------------------------------------------------
     def sync_markets(self, actives: list[dict]) -> set[str]:
@@ -271,11 +272,6 @@ class Engine:
         else:
             self.cash += payout - fees
         avg_px = (sum(p * q for p, q, _ in s.fills) / s.total_qty) if s.total_qty else None
-        self.store.window((s.ticker, s.asset, s.series, s.close_ts, s.strike, true_settle,
-                           result, s.decision_margin,
-                           "yes" if s.bet_yes else ("no" if s.decided else None),
-                           int(s.gate_active), len(s.fills), s.total_qty, avg_px,
-                           gross, fees, net, int(won) if s.decided else None, self.cash))
         b60 = self._local_avg60(s.symbol, s.close_ts) or \
             self.disc.binance_avg60(s.symbol, s.close_ts)
         if b60 is not None:
@@ -284,13 +280,14 @@ class Engine:
             self.store.debias_row(s.ticker, s.asset, s.close_ts, b60, true_settle, err)
         s.settled = True
         if s.fills:
+            self.store.window((s.ticker, s.asset, s.series, s.close_ts, s.strike, true_settle,
+                               result, s.decision_margin,
+                               "yes" if s.bet_yes else ("no" if s.decided else None),
+                               int(s.gate_active), len(s.fills), s.total_qty, avg_px,
+                               gross, fees, net, int(won) if s.decided else None, self.cash))
             self.log(f"SETTLED {s.ticker} [{s.asset}] {result.upper()} "
                      f"{'WIN' if won else 'LOSS'} qty={s.total_qty:.1f} "
                      f"net=${net:+.3f} bal=${self.cash:.2f}")
-        else:
-            why = ("gate off" if (s.decided and not s.gate_active)
-                   else "no decision" if not s.decided else "no panic print<=CAP")
-            self.store.event("settled_notrade", f"{s.ticker} {result} ({why})")
 
     def _local_avg60(self, symbol: str, close_ts: int):
         ps = [self.feed.price_at(symbol, e) for e in range(close_ts - C.SETTLE_SECS, close_ts)]

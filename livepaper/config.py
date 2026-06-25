@@ -34,10 +34,11 @@ def _envf(name: str, default: float) -> float:
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / (f"data_{ASSET.lower()}" if ASSET else "data")
 DB_PATH = DATA / "paper.db"
+SHARED_PORTFOLIO_DB = ROOT / "data_shared" / "portfolio.db"
 RAW_KALSHI = DATA / "raw_kalshi.jsonl"
 RAW_BINANCE = DATA / "raw_binance.jsonl"
 LOG_PATH = DATA / "run.log"
-RAW_DUMP = True
+RAW_DUMP = False
 
 # ---- markets to trade -------------------------------------------------------
 # Each: series ticker, asset key, Binance symbol (1s spot proxy for that RTI),
@@ -127,11 +128,11 @@ MAX_WINDOW_NOTIONAL = 1_000_000.0   # absolute hard ceiling only; live size = 10
 
 # ---- LIVE trading (REAL money) ---------------------------------------------
 # OFF unless VELA_LIVE=1. When on, the executor places REAL Kalshi maker orders
-# instead of simulating fills off the tape. Fixed $5/window sizing (NOT the paper
-# 10%-compounding). Guarded by a kill switch + daily-loss halt. See live_exec.py.
+# instead of simulating fills off the tape. Live order size is
+# PORTFOLIO_FRACTION of the shared live risk ledger in SHARED_PORTFOLIO_DB.
+# Guarded by a kill switch + daily-loss halt. See live_exec.py.
 LIVE = os.environ.get("VELA_LIVE", "") == "1"
 LIVE_DEMO = os.environ.get("VELA_LIVE_DEMO", "") == "1"   # use Kalshi demo cluster
-POSITION_USD = _envf("VELA_POSITION_USD", 5.0)   # fixed notional/window (env-overridable per bot)
 LIVE_REST_FLOOR = WIN_PX_FLOOR  # never rest a buy below this (adverse-selection guard)
 LIVE_REST_CAP = CAP             # never rest a buy above this (no-discount guard)
 # resting price: join the favored side's best bid (be the maker a panic seller hits),
@@ -139,7 +140,8 @@ LIVE_REST_CAP = CAP             # never rest a buy above this (no-discount guard
 LIVE_JOIN_BEST_BID = True
 # risk guards
 LIVE_MAX_DAILY_LOSS = _envf("VELA_MAX_DAILY_LOSS", 25.0)      # stop-loss: halt + cancel-all at this day loss (per bot)
-LIVE_MAX_OPEN_NOTIONAL = _envf("VELA_MAX_OPEN_NOTIONAL", 25.0)  # cap total resting+open exposure (per bot)
+LIVE_MAX_OPEN_NOTIONAL = _envf("VELA_MAX_OPEN_NOTIONAL", 25.0)  # absolute floor for total resting+open exposure cap
+LIVE_MAX_OPEN_FRACTION = _envf("VELA_MAX_OPEN_FRACTION", 0.50)  # cap total resting+open exposure as % of shared ledger
 LIVE_KILL_FILE = "KILL"         # presence of this file in the data dir => cancel-all + halt
 LIVE_CANCEL_BEFORE_CLOSE = 2    # cancel any unfilled remainder at sec_to_close <= this
 
@@ -148,7 +150,7 @@ LIVE_CANCEL_BEFORE_CLOSE = 2    # cancel any unfilled remainder at sec_to_close 
 # NOT replace or disable it). When VELA_STRONG_TAKE=1, on STRONG_SERIES only: if a
 # side's ASK >= STRONG_TAKE_THRESH while STRONG_TAKE_SEC_LO <= sec_to_close <
 # STRONG_TAKE_SEC_HI, send ONE *taker* buy on that side (crossing the spread, up to
-# STRONG_MAX_PX), POSITION_USD notional, hold to settlement. Ignores p_side
+# STRONG_MAX_PX), sized from the shared live risk ledger, hold to settlement. Ignores p_side
 # entirely. Its book is kept SEPARATE from the panic-fade's per-window MarketState
 # accounting (so it can't corrupt it), but it shares the SAME real account and the
 # SAME kill-switch / daily-loss / open-notional guards. Off => totally inert, so

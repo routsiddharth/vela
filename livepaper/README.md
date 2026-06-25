@@ -1,9 +1,10 @@
 # livepaper — live forward-test of the TWAP panic-fade (multi-market)
 
-A self-contained, **read-only** paper trader that runs the validated strategy
+A self-contained live forward-test runner that runs the validated strategy
 (see [`../STRATEGY.md`](../STRATEGY.md)) against **live** data and records
-everything second-by-second. It never places a real order — it only watches the
-Kalshi order book / trade feed and books *theoretical* fills.
+everything second-by-second. With `VELA_LIVE=1`, it places real Kalshi orders;
+without it, it only watches the Kalshi order book / trade feed and books
+theoretical fills.
 
 ## What it does
 
@@ -22,15 +23,14 @@ Kalshi order book / trade feed and books *theoretical* fills.
   across BTC (~$10) and ETH (~$0.27) from one constant.
 - While `sec_to_close ∈ [5,45]`, every winning-side print **≤ CAP** is faded into a
   **paper fill** (bounded by the per-window notional cap and live cash).
-- On settlement it realizes PnL, updates the shared **$50** balance, and folds the
-  realized Binance-vs-RTI error back into that asset's de-bias.
+- On settlement it realizes PnL, updates the shared live risk balance, and folds
+  the realized Binance-vs-RTI error back into that asset's de-bias.
 
 For **laddered** series (`KXBTCD` has ~100 strikes/hour), only strikes within
 `band` of spot are tracked — the rest are deep ITM/OTM and never near a panic.
 
-Current params ([`config.py`](config.py)): `THR_BPS=1.6` (≈ the lenient $10 BTC
-gate), `CAP=0.99`, `τ=45`, window `[5,45]s`, `$50` bankroll, `$5`/window cap.
-Switch to the robust edge-max cell with `THR_BPS=8.0`, `CAP=0.97`.
+Current params ([`config.py`](config.py)): `CAP=0.99`, `τ=45`, window `[1,45]s`,
+`$50` starting risk balance, live size = `10%` of shared risk balance per order.
 
 ## Run it
 
@@ -59,6 +59,7 @@ tail -f livepaper/data/run.log    # live decisions / settlements
 | file | contents |
 |------|----------|
 | `paper.db` | SQLite (WAL) — query live with `sqlite3 paper.db` |
+| `../data_shared/portfolio.db` | shared live risk balance for split BTC/ETH bots |
 | `raw_kalshi.jsonl` | every Kalshi WS message (book/trade/lifecycle) |
 | `raw_binance.jsonl` | every Binance 1s close |
 | `run.log` | human-readable event log |

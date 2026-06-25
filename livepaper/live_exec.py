@@ -2,17 +2,18 @@
 
 Lifecycle per window (BTC only, when VELA_LIVE=1):
   decision (gate ON, ~45s)  -> rest ONE post-only limit buy on the favored side,
-                               $5 notional, price = favored best bid clamped to
-                               [floor, cap]  (be the maker a panic seller hits)
+                               10% of the shared live risk ledger, price =
+                               favored best bid clamped to [floor, cap]
+                               (be the maker a panic seller hits)
   each tick                 -> poll real fills, fold them into the window state so
                                the engine's normal settlement/accounting works
   sec_to_close <= 2         -> cancel any unfilled remainder
-  settle                    -> realized PnL from real fills; reconcile cash from the
-                               real account balance
+  settle                    -> realized PnL from real fills; update the shared
+                               risk ledger
 
-Safety: post_only (maker-only, never crosses), fixed $5/window, a kill-switch file,
-a daily-loss halt, an open-notional cap, startup reconciliation, and cancel-all on
-shutdown. Nothing here runs unless config.LIVE is true.
+Safety: post_only (maker-only, never crosses), shared-ledger sizing, a kill-switch
+file, a daily-loss halt, an open-notional cap, startup reconciliation, and
+cancel-all on shutdown. Nothing here runs unless config.LIVE is true.
 """
 from __future__ import annotations
 import math
@@ -20,6 +21,7 @@ from pathlib import Path
 
 from . import config as C
 from .broker import new_client_order_id
+from .shared_portfolio import SharedPortfolio
 
 
 def _maker_fee(qty: int, p: float) -> float:
@@ -45,6 +47,8 @@ class LiveExecutor:
         self.halted = False
         self.day_realized = 0.0         # fade + strong combined (drives the shared halt)
         self.balance = None
+        self.real_balance = None
+        self.portfolio = SharedPortfolio(C.SHARED_PORTFOLIO_DB, C.BANKROLL, log=log)
 
     def attach(self, states: dict) -> None:
         self.states = states
@@ -53,9 +57,11 @@ class LiveExecutor:
     def startup_reconcile(self) -> None:
         try:
             self.b.cancel_all()
-            self.balance = self.b.balance_dollars()
-            self.log(f"[live] startup balance ${self.balance:.2f}  "
-                     f"(demo={C.LIVE_DEMO}, $/window={C.POSITION_USD})")
+            self.real_balance = self.b.balance_dollars()
+            self.balance = self.portfolio.balance()
+            self.log(f"[live] startup real_balance=${self.real_balance:.2f} "
+                     f"risk_balance=${self.balance:.2f} "
+                     f"(demo={C.LIVE_DEMO}, size={C.PORTFOLIO_FRACTION:.0%}/trade)")
         except Exception as e:
             self.log(f"[live] startup reconcile error: {e}")
             self.store.event("live_startup_err", str(e)[:200])
@@ -65,6 +71,7 @@ class LiveExecutor:
             self.b.cancel_all()
         except Exception:
             pass
+        self.portfolio.close()
 
     # ---- kill / halt ----
     def killed(self) -> bool:
@@ -87,6 +94,22 @@ class LiveExecutor:
                    for book in (self.orders, self.strong_orders)
                    for r in book.values() if not r.get("done"))
 
+    def _risk_balance(self) -> float:
+        self.balance = self.portfolio.balance()
+        return max(0.0, self.balance)
+
+    def _target_notional(self) -> float:
+        return C.PORTFOLIO_FRACTION * self._risk_balance()
+
+    def _max_open_notional(self) -> float:
+        return max(C.LIVE_MAX_OPEN_NOTIONAL,
+                   C.LIVE_MAX_OPEN_FRACTION * self._risk_balance())
+
+    def _count_for_price(self, px: float, target_notional: float) -> int:
+        if px <= 0 or target_notional <= 0:
+            return 0
+        return max(1, round(target_notional / px))
+
     # ---- ALT pathway: taker-take a near-certain favorite (config.STRONG_TAKE) --
     def consider_take(self, s, sec: float, now: float) -> None:
         """Independent of the panic-fade. Once per window, on STRONG_SERIES only:
@@ -105,10 +128,16 @@ class LiveExecutor:
             side, px = "no", min(C.STRONG_MAX_PX, na)
         if side is None:
             return
-        if self._open_notional() + C.POSITION_USD > C.LIVE_MAX_OPEN_NOTIONAL:
-            self.store.event("strong_skip", f"{s.ticker} open-notional cap")
+        target = self._target_notional()
+        count = self._count_for_price(px, target)
+        if count <= 0:
+            self.store.event("strong_skip", f"{s.ticker} zero risk balance")
             return
-        count = max(1, round(C.POSITION_USD / px))
+        order_notional = count * px
+        if self._open_notional() + order_notional > self._max_open_notional():
+            self.store.event("strong_skip",
+                             f"{s.ticker} open-notional cap target={target:.2f}")
+            return
         coid = new_client_order_id()
         try:
             o = self.b.place_taker_buy(s.ticker, side, px, count, coid)
@@ -126,16 +155,22 @@ class LiveExecutor:
     def on_decision(self, s, sec: float) -> None:
         if self.killed() or s.ticker in self.orders:
             return
-        if self._open_notional() + C.POSITION_USD > C.LIVE_MAX_OPEN_NOTIONAL:
-            self.store.event("live_skip", f"{s.ticker} open-notional cap")
-            return
         side = "yes" if s.bet_yes else "no"
         bid = s.book.best_yes_bid() if side == "yes" else s.book.best_no_bid()
         if bid is None:
             self.store.event("live_skip", f"{s.ticker} no {side} bid to join")
             return
         px = min(C.LIVE_REST_CAP, max(C.LIVE_REST_FLOOR, bid))
-        count = max(1, round(C.POSITION_USD / px))
+        target = self._target_notional()
+        count = self._count_for_price(px, target)
+        if count <= 0:
+            self.store.event("live_skip", f"{s.ticker} zero risk balance")
+            return
+        order_notional = count * px
+        if self._open_notional() + order_notional > self._max_open_notional():
+            self.store.event("live_skip",
+                             f"{s.ticker} open-notional cap target={target:.2f}")
+            return
         coid = new_client_order_id()
         try:
             o = self.b.place_limit_buy(s.ticker, side, px, count, coid)
@@ -237,10 +272,13 @@ class LiveExecutor:
         self.day_realized += net
         if self.orders.get(ticker):
             self.orders[ticker]["done"] = True
+        s = self.states.get(ticker)
+        self.balance = self.portfolio.apply_settlement(
+            f"fade:{ticker}", ticker, "fade", getattr(s, "asset", None), net)
         if self.day_realized <= -C.LIVE_MAX_DAILY_LOSS:
             self._halt(f"daily loss {self.day_realized:+.2f} <= -{C.LIVE_MAX_DAILY_LOSS}")
         try:
-            self.balance = self.b.balance_dollars()
+            self.real_balance = self.b.balance_dollars()
         except Exception:
             pass
         return self.balance if self.balance is not None else 0.0
@@ -269,7 +307,10 @@ class LiveExecutor:
                  f"net=${net:+.3f}")
         if self.day_realized <= -C.LIVE_MAX_DAILY_LOSS:
             self._halt(f"daily loss {self.day_realized:+.2f} <= -{C.LIVE_MAX_DAILY_LOSS}")
+        s = self.states.get(ticker)
+        self.balance = self.portfolio.apply_settlement(
+            f"strong:{ticker}", ticker, "strong", getattr(s, "asset", None), net)
         try:
-            self.balance = self.b.balance_dollars()
+            self.real_balance = self.b.balance_dollars()
         except Exception:
             pass

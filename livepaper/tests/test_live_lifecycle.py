@@ -31,6 +31,7 @@ class FakeBook:
 class FakeState:
     def __init__(self, ticker, bet_yes, yes_bid=None, no_bid=None, sec=45):
         self.ticker = ticker
+        self.asset = "BTC"
         self.bet_yes = bet_yes
         self.book = FakeBook(yes_bid, no_bid)
         self.decision_margin = 12.3
@@ -47,6 +48,8 @@ class FakeStore:
 
 
 def main() -> int:
+    C.SHARED_PORTFOLIO_DB = Path(tempfile.mkdtemp()) / "portfolio.db"
+
     print("== unit: px_cents conversion ==")
     check("0.59 -> 59c", px_cents(0.59) == 59)
     check("0.005 clamps to 1c", px_cents(0.005) == 1)
@@ -59,14 +62,17 @@ def main() -> int:
     ex = LiveExecutor(b, st, lambda m: None, Path(tempfile.mkdtemp()))
     ex.attach({state.ticker: state})
     ex.startup_reconcile()
-    check("startup reconciled real balance", ex.balance == 100.0)
+    check("startup uses shared risk balance", ex.balance == C.BANKROLL)
+    check("startup still reads real broker balance", ex.real_balance == 100.0)
 
     ex.on_decision(state, 45)
     resting = b.resting_orders()
-    expect_ct = max(1, round(C.POSITION_USD / 0.59))   # round(5/0.59)=8
+    target = C.PORTFOLIO_FRACTION * C.BANKROLL
+    expect_ct = max(1, round(target / 0.59))   # round(5/0.59)=8
     check("one resting order placed", len(resting) == 1)
     check("side = no (bet_yes False)", resting and resting[0]["side"] == "no")
-    check(f"count = {expect_ct} (~$5/0.59)", resting and resting[0]["count"] == expect_ct)
+    check(f"count = {expect_ct} (10% risk balance / 0.59)",
+          resting and resting[0]["count"] == expect_ct)
     check("price clamped within [floor,cap]",
           resting and C.LIVE_REST_FLOOR <= resting[0]["price"] <= C.LIVE_REST_CAP)
     oid = resting[0]["order_id"]
@@ -87,13 +93,15 @@ def main() -> int:
     ex.poll_and_manage(now=0.0)
     check("unfilled remainder cancelled", len(b.resting_orders()) == 0)
 
-    # settle a WIN: payout = qty*$1, reconcile real balance
+    # settle a WIN: payout = qty*$1, update the shared risk balance
     payout = state.total_qty * 1.0
     b.credit(payout)
     net = payout - state.window_cost - 0.01
     bal_after = ex.note_settle(state.ticker, net)
-    expected_bal = 100.0 - 3 * 0.59 - 0.01 + payout
-    check("balance reconciled from broker after settle", abs(bal_after - expected_bal) < 1e-9)
+    expected_bal = C.BANKROLL + net
+    check("risk balance updated from live PnL", abs(bal_after - expected_bal) < 1e-9)
+    check("real broker balance still refreshed separately",
+          abs(ex.real_balance - (100.0 - 3 * 0.59 - 0.01 + payout)) < 1e-9)
     check("day_realized updated", abs(ex.day_realized - net) < 1e-9)
 
     print("== guard: open-notional cap blocks new orders ==")
@@ -107,7 +115,10 @@ def main() -> int:
         ex2.attach(states2)
         ex2.on_decision(s, 45)
         placed = len(b2.resting_orders())
-    cap_ct = int(C.LIVE_MAX_OPEN_NOTIONAL // C.POSITION_USD)
+    cap_notional = max(C.LIVE_MAX_OPEN_NOTIONAL,
+                       C.LIVE_MAX_OPEN_FRACTION * ex2.portfolio.balance())
+    per_order = round((C.PORTFOLIO_FRACTION * ex2.portfolio.balance()) / 0.50) * 0.50
+    cap_ct = int(cap_notional // per_order)
     check(f"stopped placing at open-notional cap (~{cap_ct} orders, got {placed})",
           placed <= cap_ct + 1 and placed < 20)
 

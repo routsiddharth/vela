@@ -33,6 +33,7 @@ class FakeBook:
 class FakeState:
     def __init__(self, ticker, series="KXBTC15M", yes_ask=None, no_ask=None, sec=40):
         self.ticker = ticker
+        self.asset = "BTC"
         self.series = series
         self.bet_yes = True
         self.book = FakeBook(yes_ask=yes_ask, no_ask=no_ask)
@@ -50,6 +51,7 @@ class FakeStore:
 
 
 def _exec(broker, store, tmp=None):
+    C.SHARED_PORTFOLIO_DB = Path(tempfile.mkdtemp()) / "portfolio.db"
     return LiveExecutor(broker, store, lambda m: None, tmp or Path(tempfile.mkdtemp()))
 
 
@@ -63,11 +65,13 @@ def main() -> int:
     ex.attach({s.ticker: s})
     ex.consider_take(s, 40, 0.0)
     resting = b.resting_orders()
-    expect_ct = max(1, round(C.POSITION_USD / 0.96))
+    target = C.PORTFOLIO_FRACTION * ex.portfolio.balance()
+    expect_ct = max(1, round(target / 0.96))
     check("one taker order placed", len(resting) == 1)
     check("side = yes", resting and resting[0]["side"] == "yes")
     check("price = ask 0.96", resting and abs(resting[0]["price"] - 0.96) < 1e-9)
-    check(f"count = {expect_ct} (~$5/0.96)", resting and resting[0]["count"] == expect_ct)
+    check(f"count = {expect_ct} (10% risk balance / 0.96)",
+          resting and resting[0]["count"] == expect_ct)
     check("tagged strong095 in store", any(k.get("detail") == "strong095"
                                            for _, k in st.orders))
 

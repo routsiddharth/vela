@@ -28,6 +28,7 @@ testing/data/
 
 # --- claude ---
 CLAUDE.md
+DEPLOY.md
 .claude/
 
 # --- os / editor ---
