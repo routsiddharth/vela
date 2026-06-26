@@ -15,25 +15,9 @@ trades the gap between what is already decided and what the book is still pricin
 
 ## Motivation and beginnings
 
-Kalshi is the first CFTC-regulated exchange for event contracts — a young market where,
-as with any young market, the structural inefficiencies haven't yet been competed away.
-I started poking at it out of curiosity about that microstructure, and the project grew
-into a hands-on way to learn real-time quant execution end to end: reconstructing a
-reference index from raw feeds, calibrating a probability online, and managing live order
-flow against modeled fees. The real seed, though, was a single observation. Scrolling the
-short-dated crypto markets one day, I actually read the resolution criteria — these
-contracts don't settle on the last price, they settle on the **mean of 60 samples over the
-final 60 seconds** — and noticed the order book was still quoting them as if the terminal
-tick decided everything.
+Kalshi is the first CFTC-regulated exchange for event contracts, a young market where the structural inefficiencies haven't yet been competed away. I was poking around on it out of curiosity and discovered that the short-term crypto markets do not resolve on the last price, but instead they settle on the **mean of 60 samples over the final 60 seconds**, and noticed the order book sometimes still quoted them as if the final tick decided everything.
 
-That gap is the whole thesis: once most of those 60 samples are banked, the outcome is
-**near-determined** while implied probability is still mean-reverting around 0.50, and
-flow-driven participants keep dumping the winning side on late ticks the average has
-already absorbed. Vela is the attempt to harvest that — to find a repeatable pattern in
-something that *looks* like noise (a coin-flip binary) but is actually mostly resolved
-arithmetic. It began as a paper simulator to test whether the edge survived fees and
-slippage; once it did, it went live on real capital. Convergence arithmetic and
-disciplined execution, not directional forecasting.
+Once most of the 60 samples are banked, the outcome is near-determined and the book usually prices the won side near $0.98–0.99. But flow traders still panic-dump that side on late spot ticks the 60s average has already absorbed, knocking the price sharply below fair for a few seconds before it settles at $1. Vela rests bids to catch those dislocations (panic-fade) and also pays up for the won side when it's near-certain but still carries a spread to $1 (strong-take). As of today (06/26), it has returned over 71% in 9 days - quite a small sample size, but I look forward to seeing how it performs in the coming months as well as what the strategy's capacity is.
 
 ---
 
@@ -44,12 +28,7 @@ above $X at the top of the hour?") **do not settle on the terminal price** — t
 settle on the **arithmetic mean of 60 CF-Benchmarks RTI samples over the final 60
 seconds.**
 
-A mean is a low-pass filter. Once ~45 of the 60 samples are banked, the residual 15
-have bounded leverage over the result, so the outcome is frequently **near-determined
-while implied probability is still mean-reverting around 0.50.** Flow-driven
-participants mark to *last price* and dump the winning side on a late tick that the
-average has already absorbed — the side still settles at $1. That is the
-mispricing Vela harvests.
+A mean is a low-pass filter. Once ~45 of the 60 samples are banked, the residual 15 have bounded leverage over the result, so the outcome is frequently near-determined while the book still prices the winning side near $0.98–0.99. Flow-driven participants mark to last price and dump the winning side on a late tick that the average has already absorbed, knocking it transiently below fair before it settles at $1. Vela takes advantage of these mispricings.
 
 **Execution loop:**
 1. Reconstruct the settling 60s TWAP in real time from **Binance 1s** prints, with a
