@@ -133,6 +133,14 @@ MAX_WINDOW_NOTIONAL = 1_000_000.0   # absolute hard ceiling only; live size = 10
 # Guarded by a kill switch + daily-loss halt. See live_exec.py.
 LIVE = os.environ.get("VELA_LIVE", "") == "1"
 LIVE_DEMO = os.environ.get("VELA_LIVE_DEMO", "") == "1"   # use Kalshi demo cluster
+
+# ---- migration shadow mode (MIGRATION_PLAN.md Phase 1) ----------------------
+# VELA_SHADOW=1 makes the engine ALSO compute the new PriceBlend.price()+projection
+# path each tick and log any divergence from the live _estimate path to the
+# `shadow_diff` table. Trading stays on the OLD path — this only observes. Off by
+# default; opt in when restarting the bots to collect the N-day parity evidence
+# that gates the Phase-1 cutover.
+SHADOW = os.environ.get("VELA_SHADOW", "") == "1"
 LIVE_REST_FLOOR = WIN_PX_FLOOR  # never rest a buy below this (adverse-selection guard)
 LIVE_REST_CAP = CAP             # never rest a buy above this (no-discount guard)
 # resting price: join the favored side's best bid (be the maker a panic seller hits),

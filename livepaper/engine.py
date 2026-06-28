@@ -13,6 +13,10 @@ from __future__ import annotations
 import math, time
 from . import config as C
 from .market import MarketState
+from .priceblend import PriceBlend
+from .projection import project
+
+_SHADOW_TOL = 1e-9   # below this, the new path is considered to match the live path
 
 
 def maker_order_fee(qty: float, p: float) -> float:
@@ -76,6 +80,9 @@ class Engine:
         self.realized = 0.0
         self.n_trades = 0
         self.last_px_logged: dict[str, int] = {}
+        # Phase-1 shadow: the new PriceBlend producer over the SAME feed + de-bias.
+        # Built always (cheap — just references); only exercised when C.SHADOW.
+        self.priceblend = PriceBlend(feed, debias)
         # ---- LIVE trading (real Kalshi orders); None in paper mode --------------
         self.live = None
         if C.LIVE or live_broker is not None:
@@ -229,6 +236,10 @@ class Engine:
             self.store.oracle(s.ticker, s.asset, sec, spot_sec,
                               self.feed.recent_sigma(s.symbol, C.SIGMA_LOOKBACK),
                               self.debias[s.asset].resid_std(), sd_S, p_side)
+            if C.SHADOW:
+                self._shadow_check(s, sec, now,
+                                   mhat=mhat, margin=margin, sd_S=sd_S, p_side=p_side,
+                                   n_lock=n_lock, lmean=lmean, shat=shat)
             if self.live is not None:
                 self.live.consider_take(s, sec, now)   # ALT pathway (no-op unless STRONG_TAKE)
 
@@ -254,6 +265,27 @@ class Engine:
         diff_var = sigma_sec ** 2 * _remaining_var_factor(n_rem)
         sd_S = math.sqrt(diff_var + proxy_sd ** 2) or 1e-6
         return mhat, margin, n_lock, lmean, shat, sd_S
+
+    # ---- Phase-1 shadow: new PriceBlend+projection path vs the live path -----
+    def _shadow_check(self, s: MarketState, sec: float, now: float, *,
+                      mhat, margin, sd_S, p_side, n_lock, lmean, shat) -> None:
+        """Compute the §2 path (PriceBlend.price -> projection) over the SAME feed,
+        de-bias, and `now` the live tick just used, and record any divergence. By
+        construction this should be exactly zero (the offline golden master proves
+        project == _estimate); shadow confirms it holds in the live process. Pure
+        observation — never alters a decision, fill, or order."""
+        nb = self.priceblend.price(s.asset)
+        if nb is None:
+            return
+        pr = project(nb, lambda e: self.feed.price_at(s.symbol, e),
+                     s.strike, s.close_ts, now)
+        for field, old, new in (("mhat", mhat, pr.mhat), ("margin", margin, pr.margin),
+                                ("sd_S", sd_S, pr.sd_S), ("p_side", p_side, pr.p_side),
+                                ("n_lock", n_lock, pr.n_lock), ("lmean", lmean, pr.lmean),
+                                ("shat", shat, pr.shat)):
+            d = float(new) - float(old)
+            if abs(d) > _SHADOW_TOL:
+                self.store.shadow(s.ticker, s.asset, sec, field, float(old), float(new), d)
 
     # ---- settlement ---------------------------------------------------------
     def settle_closed(self) -> None:
