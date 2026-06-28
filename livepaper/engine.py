@@ -222,6 +222,13 @@ class Engine:
                                 mhat, s.strike, margin, thr_abs,
                                 ("yes" if s.bet_yes else "no") if s.decided else None,
                                 s.gate_active, s.decided)
+            # Phase-0 golden master: log the RAW sigma_sec/resid_std behind sd_S
+            # (recomputed identically to _estimate — deterministic, no side effects,
+            # so _estimate stays the untouched oracle) plus the realized sd_S/p_side
+            # and the raw-average second. Additive; never feeds back into a decision.
+            self.store.oracle(s.ticker, s.asset, sec, spot_sec,
+                              self.feed.recent_sigma(s.symbol, C.SIGMA_LOOKBACK),
+                              self.debias[s.asset].resid_std(), sd_S, p_side)
             if self.live is not None:
                 self.live.consider_take(s, sec, now)   # ALT pathway (no-op unless STRONG_TAKE)
 

@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS estimates(
   ts_ms INTEGER, ticker TEXT, asset TEXT, sec_to_close REAL, spot REAL, n_lock INTEGER,
   locked_mean REAL, s_hat_binance REAL, delta REAL, mhat REAL, strike REAL,
   margin_hat REAL, thr_abs REAL, bet_side TEXT, gate_active INTEGER, decided INTEGER);
+CREATE TABLE IF NOT EXISTS est_oracle(
+  ts_ms INTEGER, ticker TEXT, asset TEXT, sec_to_close REAL, spot_sec INTEGER,
+  sigma_sec REAL, resid_std REAL, sd_S REAL, p_side REAL);
 CREATE TABLE IF NOT EXISTS trades(
   ts_ms INTEGER, ticker TEXT, sec_to_close REAL, yes_price REAL, no_price REAL,
   size REAL, taker_side TEXT);
@@ -50,6 +53,7 @@ CREATE TABLE IF NOT EXISTS orders(
 CREATE TABLE IF NOT EXISTS events(ts_ms INTEGER, kind TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS ix_book ON book_snaps(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_est ON estimates(ticker, ts_ms);
+CREATE INDEX IF NOT EXISTS ix_oracle ON est_oracle(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_tr ON trades(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_px ON prices(symbol, epoch_sec);
 """
@@ -111,6 +115,15 @@ class Store:
         self._w("INSERT INTO estimates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now_ms(), t, asset, sec, spot, n_lock, lmean, shat, delta, mhat,
                  strike, margin, thr_abs, bet, int(gate), int(decided)))
+
+    def oracle(self, t, asset, sec, spot_sec, sigma_sec, resid_std, sd_S, p_side) -> None:
+        """Phase-0 golden-master row: the per-tick (sigma_sec, resid_std, sd_S,
+        p_side) + raw-average second behind each `estimate`. Additive — lets later
+        migration phases be checked against the exact recorded live oracle without
+        re-deriving sd_S from thr_abs/Z_GATE. sigma_sec/resid_std are RAW (NULL
+        until warm); sd_S/p_side are the post-fallback values actually used."""
+        self._w("INSERT INTO est_oracle VALUES(?,?,?,?,?,?,?,?,?)",
+                (now_ms(), t, asset, sec, spot_sec, sigma_sec, resid_std, sd_S, p_side))
 
     def trade(self, t, sec, yp, np_, sz, taker) -> None:
         self._w("INSERT INTO trades VALUES(?,?,?,?,?,?,?)",
