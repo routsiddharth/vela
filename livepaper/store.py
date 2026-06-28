@@ -33,9 +33,6 @@ CREATE TABLE IF NOT EXISTS estimates(
 CREATE TABLE IF NOT EXISTS est_oracle(
   ts_ms INTEGER, ticker TEXT, asset TEXT, sec_to_close REAL, spot_sec INTEGER,
   sigma_sec REAL, resid_std REAL, sd_S REAL, p_side REAL);
-CREATE TABLE IF NOT EXISTS shadow_diff(
-  ts_ms INTEGER, ticker TEXT, asset TEXT, sec_to_close REAL,
-  field TEXT, old REAL, new REAL, diff REAL);
 CREATE TABLE IF NOT EXISTS trades(
   ts_ms INTEGER, ticker TEXT, sec_to_close REAL, yes_price REAL, no_price REAL,
   size REAL, taker_side TEXT);
@@ -57,7 +54,6 @@ CREATE TABLE IF NOT EXISTS events(ts_ms INTEGER, kind TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS ix_book ON book_snaps(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_est ON estimates(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_oracle ON est_oracle(ticker, ts_ms);
-CREATE INDEX IF NOT EXISTS ix_shadow ON shadow_diff(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_tr ON trades(ticker, ts_ms);
 CREATE INDEX IF NOT EXISTS ix_px ON prices(symbol, epoch_sec);
 """
@@ -128,14 +124,6 @@ class Store:
         until warm); sd_S/p_side are the post-fallback values actually used."""
         self._w("INSERT INTO est_oracle VALUES(?,?,?,?,?,?,?,?,?)",
                 (now_ms(), t, asset, sec, spot_sec, sigma_sec, resid_std, sd_S, p_side))
-
-    def shadow(self, t, asset, sec, field, old, new, diff) -> None:
-        """Phase-1 shadow divergence: the new PriceBlend+projection path produced
-        `new` where the live _estimate path produced `old`, off by `diff`. Written
-        ONLY when nonzero, so an empty/quiet table == perfect parity. Trading is
-        unaffected; this is pure observation (MIGRATION_PLAN.md Phase 1)."""
-        self._w("INSERT INTO shadow_diff VALUES(?,?,?,?,?,?,?,?)",
-                (now_ms(), t, asset, sec, field, old, new, diff), commit=True)
 
     def trade(self, t, sec, yp, np_, sz, taker) -> None:
         self._w("INSERT INTO trades VALUES(?,?,?,?,?,?,?)",

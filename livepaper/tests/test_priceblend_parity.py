@@ -15,23 +15,23 @@ from pathlib import Path
 import pytest
 
 from livepaper import config as C
-from livepaper import engine as eng
 from livepaper import projection as proj
 from livepaper.contract import RawAvgBundle, SettlementTruth
 from livepaper.priceblend import PriceBlend
 from livepaper.market import Debias
-from livepaper.replay import run_parity, ReplayFeed, _Oracle
+from livepaper.replay import (run_parity, ReplayFeed, _legacy_norm_cdf,
+                              _legacy_remaining_var_factor, _legacy_local_avg60)
 
 
-# --- 1. primitive equivalence ------------------------------------------------
-def test_remaining_var_factor_matches_engine():
+# --- 1. primitive equivalence (projection's copies == frozen pre-migration) --
+def test_remaining_var_factor_matches_legacy():
     for n in range(0, C.SETTLE_SECS + 1):
-        assert proj._remaining_var_factor(n) == eng._remaining_var_factor(n), n
+        assert proj._remaining_var_factor(n) == _legacy_remaining_var_factor(n), n
 
 
-def test_norm_cdf_matches_engine():
+def test_norm_cdf_matches_legacy():
     for x in (-6.0, -2.5, -1.0, -0.3, 0.0, 0.3, 1.0, 2.5, 6.0, 18.6):
-        assert proj._norm_cdf(x) == eng._norm_cdf(x), x
+        assert proj._norm_cdf(x) == _legacy_norm_cdf(x), x
 
 
 # --- 2. projection logic (closed form, no DB) --------------------------------
@@ -131,9 +131,9 @@ def test_replay_golden_master(asset):
 
 
 @pytest.mark.parametrize("asset", ["BTC", "ETH"])
-def test_calibrate_avg60_matches_engine(asset):
-    """PriceBlend._local_avg60 (calibration path) reproduces the REAL
-    Engine._local_avg60 bit-for-bit on the same feed, over recorded windows."""
+def test_calibrate_avg60_matches_legacy(asset):
+    """PriceBlend._local_avg60 (calibration path) reproduces the FROZEN
+    pre-migration avg60 bit-for-bit on the same feed, over recorded windows."""
     import sqlite3
     db = _db_for(asset)
     if not db.exists():
@@ -146,12 +146,11 @@ def test_calibrate_avg60_matches_engine(asset):
     con.close()
     if not wins:
         pytest.skip(f"no settled windows for {asset}")
-    o = _Oracle(feed, {})                                  # borrows Engine._local_avg60
     checked = 0
     for (close_ts,) in wins:
         pb = PriceBlend(feed, {asset: Debias(asset, symbol)}, asset_symbol={asset: symbol})
         got = pb._local_avg60(symbol, int(close_ts))
-        want = eng.Engine._local_avg60(o, symbol, int(close_ts))
+        want = _legacy_local_avg60(feed, symbol, int(close_ts))
         assert got == want, (asset, close_ts, got, want)   # both None or both equal
         checked += 1
     assert checked > 0

@@ -63,6 +63,17 @@ class PriceBlend:
             resid_std=self.debias[asset].resid_std(),
         )
 
+    def bucket_at(self, asset: str, sec: int) -> float | None:
+        """Raw_avg for an already-elapsed second of this asset's stream — what the
+        trading-side projection averages over the window's locked seconds. In-process
+        this reads PriceBlend's own feed buffer (the full per-second history); across
+        a process boundary (Phase 2) the trading side buffers the emitted stream
+        instead. Either way the engine never touches the raw feed directly."""
+        symbol = self.asset_symbol.get(asset)
+        if symbol is None:
+            return None
+        return self.feed.price_at(symbol, sec)
+
     # ---- §2.B consumer (self-calibration) -----------------------------------
     def calibrate(self, truth: SettlementTruth) -> CalibrationResult:
         """Record one settlement-truth into the de-bias tracker. Mirrors

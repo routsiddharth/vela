@@ -7,9 +7,11 @@ process. This is the oracle every later phase is gated against.
 Two distinct things, kept separate (this separation is the whole point):
 
   PRIMARY GATE — behaviour-preserving refactor. For each recorded tick we drive
-  BOTH the real `Engine._estimate` (borrowed verbatim) and the new
-  `projection.project` from the *same* ReplayFeed + reconstructed Debias, and
-  assert they agree to the bit. Because both consume the identical feed, any gap
+  BOTH the FROZEN pre-migration estimate (`_legacy_estimate`, an exact copy of
+  the old engine._estimate) and the new `projection.project` from the *same*
+  ReplayFeed + reconstructed Debias, and assert they agree to the bit. The
+  legacy copy is the oracle, kept self-contained so the gate survives deleting
+  Engine._estimate. Because both consume the identical feed, any gap
   in the recorded prices cancels out — this isolates "does the new code compute
   what the old code computes" from "is the recording faithful". This MUST be 0.
 
@@ -30,11 +32,73 @@ import argparse, bisect, math, sqlite3, statistics, types
 from dataclasses import dataclass, field
 from . import config as C
 from .contract import RawAvgBundle
-from .projection import project, _norm_cdf
+from .projection import project
 from .market import Debias
-from . import engine as _eng
 
 GUARD_SECS = 40            # de-bias membership ambiguity window around a same-asset settle
+
+
+# --------------------------------------------------------------------------- #
+#  FROZEN pre-migration reference — the golden-master ORACLE
+#  Exact copies of engine._estimate + helpers as they were BEFORE the PriceBlend
+#  cutover. projection.project must reproduce these bit-for-bit. Kept here,
+#  self-contained, so the gate survives deleting Engine._estimate from the live
+#  code (MIGRATION_PLAN.md §0: "this snapshot is the oracle for every later phase").
+# --------------------------------------------------------------------------- #
+def _legacy_norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _legacy_norm_ppf(p: float) -> float:
+    lo, hi = -10.0, 10.0
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        if _legacy_norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def _legacy_remaining_var_factor(n_rem: int) -> float:
+    if n_rem <= 1:
+        return 0.0
+    s = 0
+    for i in range(1, n_rem + 1):
+        s += i * (i + 1) // 2 + (n_rem - i) * i
+    return s / (60.0 ** 2)
+
+
+def _legacy_local_avg60(feed, symbol: str, close_ts: int):
+    ps = [feed.price_at(symbol, e) for e in range(close_ts - C.SETTLE_SECS, close_ts)]
+    ps = [p for p in ps if p is not None]
+    return sum(ps) / len(ps) if len(ps) >= 30 else None
+
+
+def _legacy_estimate(feed, debias_obj, symbol, close_ts, strike, now, spot, delta):
+    start = close_ts - C.SETTLE_SECS
+    n_elapsed = min(C.SETTLE_SECS, max(0, int(now) - start))
+    locked = [feed.price_at(symbol, e) for e in range(start, start + n_elapsed)]
+    locked = [p for p in locked if p is not None]
+    n_lock = len(locked)
+    lmean = sum(locked) / n_lock if n_lock else spot
+    shat = (lmean * n_elapsed + spot * (C.SETTLE_SECS - n_elapsed)) / C.SETTLE_SECS
+    mhat = shat - delta
+    margin = mhat - strike
+    n_rem = max(0, C.SETTLE_SECS - n_elapsed)
+    sigma_sec = feed.recent_sigma(symbol, C.SIGMA_LOOKBACK)
+    if sigma_sec is None:
+        sigma_sec = C.SIGMA_FALLBACK_BPS / 1e4 * spot
+    proxy_sd = debias_obj.resid_std()
+    if proxy_sd is None:
+        proxy_sd = C.PROXY_SD_FALLBACK_BPS / 1e4 * abs(mhat)
+    diff_var = sigma_sec ** 2 * _legacy_remaining_var_factor(n_rem)
+    sd_S = math.sqrt(diff_var + proxy_sd ** 2) or 1e-6
+    return mhat, margin, n_lock, lmean, shat, sd_S
+
+
+_Z_GATE_BY_ASSET = {a: _legacy_norm_ppf(p) for a, p in C.P_SIDE_MIN_BY_ASSET.items()}
+_Z_GATE = _legacy_norm_ppf(C.P_SIDE_MIN)
 
 
 # --------------------------------------------------------------------------- #
@@ -103,16 +167,6 @@ class ReplayFeed:
         if len(diffs) < 8:
             return None
         return statistics.pstdev(diffs)
-
-
-class _Oracle:
-    """Borrows the REAL Engine._estimate verbatim so the gate compares against the
-    live code, not a copy of it. _estimate only touches self.feed/self.debias."""
-    _estimate = _eng.Engine._estimate
-
-    def __init__(self, feed, debias: dict) -> None:
-        self.feed = feed
-        self.debias = debias
 
 
 def _debias_at(asset: str, symbol: str, samples_sorted, cts_list, now: float) -> Debias:
@@ -227,7 +281,7 @@ def run_parity(db_path, asset: str, n: int = 8000) -> ParityReport:
     rows = _sample_rows(db_path, asset, n)
     feed = ReplayFeed().load(db_path, symbol)
     samples_sorted, cts_list = _load_debias(db_path, asset)
-    z_gate = _eng.Z_GATE_BY_ASSET.get(asset, _eng.Z_GATE)
+    z_gate = _Z_GATE_BY_ASSET.get(asset, _Z_GATE)
     rep = ParityReport(asset=asset, sampled=len(rows))
 
     for r in rows:
@@ -242,13 +296,11 @@ def run_parity(db_path, asset: str, n: int = 8000) -> ParityReport:
         delta = r["delta"]                                 # LOGGED delta -> both paths use the live value
         # (reconstructing historical Debias.delta() across restarts is imperfect;
         # delta is logged per tick, so use it directly and report the drift below)
-        state = types.SimpleNamespace(symbol=symbol, close_ts=close_ts,
-                                      strike=r["strike"], asset=asset)
 
-        # ---- oracle: the REAL engine code on the replay feed -----------------
-        o = _Oracle(feed, {asset: db})
-        mhat_o, margin_o, nlock_o, lmean_o, shat_o, sdS_o = o._estimate(state, now, spot, delta)
-        pside_o = _eng._norm_cdf(abs(margin_o) / sdS_o)
+        # ---- oracle: the FROZEN pre-migration estimate on the replay feed -----
+        mhat_o, margin_o, nlock_o, lmean_o, shat_o, sdS_o = _legacy_estimate(
+            feed, db, symbol, close_ts, r["strike"], now, spot, delta)
+        pside_o = _legacy_norm_cdf(abs(margin_o) / sdS_o)
 
         # ---- new path: PriceBlend bundle -> projection on the same feed ------
         bundle = RawAvgBundle(asset=asset, ts=cursor, symbol=symbol, raw_avg=spot,

@@ -1,8 +1,12 @@
-"""The engine: per-second estimate/logging tick, trade-driven paper fills, and
-settlement — now multi-market. Each MarketState carries its asset; the engine
-routes it to that asset's Binance feed (feed.price_at(symbol, ...)) and de-bias
-(debias[asset]). The gate is RELATIVE (THR_BPS of the estimated price) so it
-scales across BTC (~$62k) and ETH (~$1.7k) without a per-asset constant.
+"""The trading engine: per-second decision/logging tick, trade-driven paper fills,
+and settlement — multi-market.
+
+Price + de-bias are owned by PriceBlend (MIGRATION_PLAN.md): each tick the engine
+pulls that asset's raw-average bundle via `priceblend.price(asset)` and runs the
+window projection (`projection.project`) to get mhat/margin/sd_S/p_side — it never
+reads the Binance feed or de-bias tracker directly. Calibration on settlement goes
+back through `priceblend.calibrate(...)`. The gate is RELATIVE (P_SIDE_MIN of the
+model probability) so it scales across BTC (~$62k) and ETH (~$1.7k).
 
 Fill model (mirrors backtest/analysis/final_strategy.py): lock the bet side at
 sec_to_close==TAU_DECISION using the causal de-biased TWAP margin; while
@@ -15,8 +19,7 @@ from . import config as C
 from .market import MarketState
 from .priceblend import PriceBlend
 from .projection import project
-
-_SHADOW_TOL = 1e-9   # below this, the new path is considered to match the live path
+from .contract import SettlementTruth
 
 
 def maker_order_fee(qty: float, p: float) -> float:
@@ -48,18 +51,6 @@ def _norm_ppf(p: float) -> float:
     return (lo + hi) / 2.0
 
 
-def _remaining_var_factor(n_rem: int) -> float:
-    """sum_{i,j in 1..n_rem} min(i,j) / 60^2. The remaining (unlocked) settlement
-    samples are collected 1..n_rem seconds ahead and share one Brownian path;
-    Var(S) = sigma_sec^2 * this. Matches fade_lib.remaining_var_factor."""
-    if n_rem <= 1:
-        return 0.0
-    s = 0
-    for i in range(1, n_rem + 1):
-        s += i * (i + 1) // 2 + (n_rem - i) * i   # sum_j min(i,j)
-    return s / (60.0 ** 2)
-
-
 Z_GATE = _norm_ppf(C.P_SIDE_MIN)   # margin (in sd_S units) to pass the default gate
 # Per-asset gate thresholds in sd_S units, so thr_abs (the displayed/stored "margin
 # needed") matches whichever gate actually applies to that asset.
@@ -80,9 +71,12 @@ class Engine:
         self.realized = 0.0
         self.n_trades = 0
         self.last_px_logged: dict[str, int] = {}
-        # Phase-1 shadow: the new PriceBlend producer over the SAME feed + de-bias.
-        # Built always (cheap — just references); only exercised when C.SHADOW.
-        self.priceblend = PriceBlend(feed, debias)
+        # PriceBlend owns price + de-bias; the engine consumes only its bundle/
+        # calibrate interface. rest_avg60 gives calibration the REST fallback the
+        # old _settle used (Discovery.binance_avg60) when the local buffer is thin.
+        self.priceblend = PriceBlend(
+            feed, debias,
+            rest_avg60=(disc.binance_avg60 if disc is not None else None))
         # ---- LIVE trading (real Kalshi orders); None in paper mode --------------
         self.live = None
         if C.LIVE or live_broker is not None:
@@ -191,24 +185,27 @@ class Engine:
         for s in list(self.states.values()):
             if s.settled:
                 continue
-            latest = self.feed.latest(s.symbol)
-            if latest is None:
+            nb = self.priceblend.price(s.asset)      # §2.A bundle: raw avg + de-bias stats
+            if nb is None:
                 continue
-            spot_sec, spot = latest
+            spot_sec, spot = nb.ts, nb.raw_avg
             if self.last_px_logged.get(s.symbol) != spot_sec:
                 self.store.price(s.symbol, spot_sec, spot)
                 self.last_px_logged[s.symbol] = spot_sec
             sec = s.sec_to_close(now)
             if sec < -5:
                 continue
-            delta = self.debias[s.asset].delta()
-            mhat, margin, n_lock, lmean, shat, sd_S = self._estimate(s, now, spot, delta)
-            p_side = _norm_cdf(abs(margin) / sd_S)   # model P(the favored side wins)
+            # Window projection on the trading side: average THIS window's locked
+            # buckets and apply the bundle's de-bias once. project() reproduces the
+            # pre-migration _estimate bit-for-bit (gated by tests/test_priceblend_parity).
+            pr = project(nb, lambda e: self.priceblend.bucket_at(s.asset, e),
+                         s.strike, s.close_ts, now)
+            mhat, margin, sd_S, p_side = pr.mhat, pr.margin, pr.sd_S, pr.p_side
             gate_min = C.P_SIDE_MIN_BY_ASSET.get(s.asset, C.P_SIDE_MIN)   # per-asset gate
             thr_abs = Z_GATE_BY_ASSET.get(s.asset, Z_GATE) * sd_S         # margin to clear it (display)
             if not s.decided and C.SEC_LO <= sec <= C.TAU_DECISION:
                 s.decided = True
-                s.bet_yes = margin > 0
+                s.bet_yes = pr.bet_yes
                 s.decision_margin = margin
                 s.sd_S = sd_S
                 s.p_side = p_side
@@ -225,67 +222,16 @@ class Engine:
                             bnb, b.no.get(bnb, 0.0) if bnb else 0.0,
                             b.yes_ask(), b.no_ask(),
                             sum(b.yes.values()), sum(b.no.values()), b.compact())
-            self.store.estimate(s.ticker, s.asset, sec, spot, n_lock, lmean, shat, delta,
-                                mhat, s.strike, margin, thr_abs,
+            self.store.estimate(s.ticker, s.asset, sec, spot, pr.n_lock, pr.lmean, pr.shat,
+                                nb.delta, mhat, s.strike, margin, thr_abs,
                                 ("yes" if s.bet_yes else "no") if s.decided else None,
                                 s.gate_active, s.decided)
-            # Phase-0 golden master: log the RAW sigma_sec/resid_std behind sd_S
-            # (recomputed identically to _estimate — deterministic, no side effects,
-            # so _estimate stays the untouched oracle) plus the realized sd_S/p_side
-            # and the raw-average second. Additive; never feeds back into a decision.
-            self.store.oracle(s.ticker, s.asset, sec, spot_sec,
-                              self.feed.recent_sigma(s.symbol, C.SIGMA_LOOKBACK),
-                              self.debias[s.asset].resid_std(), sd_S, p_side)
-            if C.SHADOW:
-                self._shadow_check(s, sec, now,
-                                   mhat=mhat, margin=margin, sd_S=sd_S, p_side=p_side,
-                                   n_lock=n_lock, lmean=lmean, shat=shat)
+            # golden-master oracle row: the RAW sigma_sec/resid_std behind sd_S (straight
+            # from the bundle) + the realized sd_S/p_side + the raw-average second.
+            self.store.oracle(s.ticker, s.asset, sec, spot_sec, nb.sigma_sec,
+                              nb.resid_std, sd_S, p_side)
             if self.live is not None:
                 self.live.consider_take(s, sec, now)   # ALT pathway (no-op unless STRONG_TAKE)
-
-    def _estimate(self, s: MarketState, now: float, spot: float, delta: float):
-        start = s.close_ts - C.SETTLE_SECS
-        n_elapsed = min(C.SETTLE_SECS, max(0, int(now) - start))
-        locked = [self.feed.price_at(s.symbol, e) for e in range(start, start + n_elapsed)]
-        locked = [p for p in locked if p is not None]
-        n_lock = len(locked)
-        lmean = sum(locked) / n_lock if n_lock else spot
-        shat = (lmean * n_elapsed + spot * (C.SETTLE_SECS - n_elapsed)) / C.SETTLE_SECS
-        mhat = shat - delta
-        margin = mhat - s.strike
-        # settlement-estimate std: diffusion of the n_rem unlocked samples + causal
-        # de-bias tracking std. Drives p_side = norm_cdf(|margin| / sd_S).
-        n_rem = max(0, C.SETTLE_SECS - n_elapsed)
-        sigma_sec = self.feed.recent_sigma(s.symbol, C.SIGMA_LOOKBACK)
-        if sigma_sec is None:
-            sigma_sec = C.SIGMA_FALLBACK_BPS / 1e4 * spot
-        proxy_sd = self.debias[s.asset].resid_std()
-        if proxy_sd is None:
-            proxy_sd = C.PROXY_SD_FALLBACK_BPS / 1e4 * abs(mhat)
-        diff_var = sigma_sec ** 2 * _remaining_var_factor(n_rem)
-        sd_S = math.sqrt(diff_var + proxy_sd ** 2) or 1e-6
-        return mhat, margin, n_lock, lmean, shat, sd_S
-
-    # ---- Phase-1 shadow: new PriceBlend+projection path vs the live path -----
-    def _shadow_check(self, s: MarketState, sec: float, now: float, *,
-                      mhat, margin, sd_S, p_side, n_lock, lmean, shat) -> None:
-        """Compute the §2 path (PriceBlend.price -> projection) over the SAME feed,
-        de-bias, and `now` the live tick just used, and record any divergence. By
-        construction this should be exactly zero (the offline golden master proves
-        project == _estimate); shadow confirms it holds in the live process. Pure
-        observation — never alters a decision, fill, or order."""
-        nb = self.priceblend.price(s.asset)
-        if nb is None:
-            return
-        pr = project(nb, lambda e: self.feed.price_at(s.symbol, e),
-                     s.strike, s.close_ts, now)
-        for field, old, new in (("mhat", mhat, pr.mhat), ("margin", margin, pr.margin),
-                                ("sd_S", sd_S, pr.sd_S), ("p_side", p_side, pr.p_side),
-                                ("n_lock", n_lock, pr.n_lock), ("lmean", lmean, pr.lmean),
-                                ("shat", shat, pr.shat)):
-            d = float(new) - float(old)
-            if abs(d) > _SHADOW_TOL:
-                self.store.shadow(s.ticker, s.asset, sec, field, float(old), float(new), d)
 
     # ---- settlement ---------------------------------------------------------
     def settle_closed(self) -> None:
@@ -311,12 +257,13 @@ class Engine:
         else:
             self.cash += payout - fees
         avg_px = (sum(p * q for p, q, _ in s.fills) / s.total_qty) if s.total_qty else None
-        b60 = self._local_avg60(s.symbol, s.close_ts) or \
-            self.disc.binance_avg60(s.symbol, s.close_ts)
-        if b60 is not None:
-            err = b60 - true_settle
-            self.debias[s.asset].add(s.close_ts, err)
-            self.store.debias_row(s.ticker, s.asset, s.close_ts, b60, true_settle, err)
+        # de-bias calibration goes back through PriceBlend: it owns the de-bias
+        # tracker, the avg60 measurement, and the REST fallback. We only persist the row.
+        cr = self.priceblend.calibrate(
+            SettlementTruth(s.ticker, s.series, s.asset, s.symbol, s.close_ts, true_settle))
+        if cr.err is not None:
+            self.store.debias_row(s.ticker, s.asset, s.close_ts,
+                                  cr.binance_avg60, true_settle, cr.err)
         s.settled = True
         if s.fills:
             self.store.window((s.ticker, s.asset, s.series, s.close_ts, s.strike, true_settle,
@@ -327,12 +274,6 @@ class Engine:
             self.log(f"SETTLED {s.ticker} [{s.asset}] {result.upper()} "
                      f"{'WIN' if won else 'LOSS'} qty={s.total_qty:.1f} "
                      f"net=${net:+.3f} bal=${self.cash:.2f}")
-
-    def _local_avg60(self, symbol: str, close_ts: int):
-        ps = [self.feed.price_at(symbol, e) for e in range(close_ts - C.SETTLE_SECS, close_ts)]
-        ps = [p for p in ps if p is not None]
-        return sum(ps) / len(ps) if len(ps) >= 30 else None
-
 
 def _f(v):
     try:
