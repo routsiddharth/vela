@@ -11,9 +11,9 @@ import sqlite3
 import pytest
 
 from livepaper import config as C
-from livepaper import engine as eng
-from livepaper.engine import Engine
-from livepaper.market import Debias, MarketState
+from livepaper.trading import engine as eng
+from livepaper.trading import Engine, MarketState
+from livepaper.priceblend import Debias
 from livepaper.replay import ReplayFeed, _legacy_estimate, _legacy_norm_cdf
 
 

@@ -17,8 +17,8 @@ Under §6.A this becomes PriceBlend's own narrow settlement reader.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
-from . import config as C
-from .contract import RawAvgBundle, SettlementTruth
+from .. import config as C
+from ..contract import RawAvgBundle, SettlementTruth
 
 
 @dataclass(frozen=True)

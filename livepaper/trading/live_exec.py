@@ -19,9 +19,9 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from . import config as C
+from .. import config as C
 from .broker import new_client_order_id
-from .shared_portfolio import SharedPortfolio
+from .portfolio import SharedPortfolio
 
 
 def _maker_fee(qty: int, p: float) -> float:

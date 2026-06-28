@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from livepaper.broker import LiveBroker
+from livepaper.trading.broker import LiveBroker
 
 DATA = ROOT / "livepaper" / "data_btc"
 DB, PIDF, KILL = DATA / "paper.db", DATA / "lp.pid", DATA / "KILL"

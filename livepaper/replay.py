@@ -32,8 +32,8 @@ import argparse, bisect, math, sqlite3, statistics, types
 from dataclasses import dataclass, field
 from . import config as C
 from .contract import RawAvgBundle
-from .projection import project
-from .market import Debias
+from .trading.projection import project
+from .priceblend import Debias
 
 GUARD_SECS = 40            # de-bias membership ambiguity window around a same-asset settle
 

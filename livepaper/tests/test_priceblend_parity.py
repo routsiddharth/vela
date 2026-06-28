@@ -15,10 +15,9 @@ from pathlib import Path
 import pytest
 
 from livepaper import config as C
-from livepaper import projection as proj
+from livepaper.trading import projection as proj
 from livepaper.contract import RawAvgBundle, SettlementTruth
-from livepaper.priceblend import PriceBlend
-from livepaper.market import Debias
+from livepaper.priceblend import PriceBlend, Debias
 from livepaper.replay import (run_parity, ReplayFeed, _legacy_norm_cdf,
                               _legacy_remaining_var_factor, _legacy_local_avg60)
 

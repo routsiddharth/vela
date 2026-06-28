@@ -10,7 +10,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .supabase_sync import SupabaseMirror
+from ..supabase_sync import SupabaseMirror
 
 
 _SCHEMA = """

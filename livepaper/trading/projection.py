@@ -28,8 +28,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import Callable
-from . import config as C
-from .contract import RawAvgBundle
+from .. import config as C
+from ..contract import RawAvgBundle
 
 
 def _norm_cdf(x: float) -> float:

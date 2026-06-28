@@ -12,8 +12,8 @@ import sys, tempfile
 from pathlib import Path
 
 from livepaper import config as C
-from livepaper.broker import MockBroker
-from livepaper.live_exec import LiveExecutor
+from livepaper.trading.broker import MockBroker
+from livepaper.trading.live_exec import LiveExecutor
 
 _checks = []
 def check(name, cond):
