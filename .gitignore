@@ -24,12 +24,17 @@ testing/data/
 *.jsonl
 *.log
 *.parquet
+!analysis/data/**/*.parquet
+# scrape checkpoints, superseded by the merged analysis/data/coinbase_trades_btc.parquet
+analysis/data/coinbase_chunks/
 *.pid
 
 # --- claude ---
 CLAUDE.md
-DEPLOY.md
 .claude/
+
+# --- docs (internal notes, not for the public repo) ---
+docs/
 
 # --- os / editor ---
 .DS_Store

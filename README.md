@@ -1,15 +1,40 @@
 # Vela
 
-**A real-time statistical-arbitrage engine for Kalshi's short-dated crypto markets — live, on real capital.**
+**A quant research project on a structural mispricing in Kalshi's short-dated crypto
+markets — run and validated live, on real capital, because live fills are the only
+honest out-of-sample test.**
 
 Vela trades a structural mispricing in TWAP-settled binary options: the settlement
 value is a 60-second average that is mostly *already realized* before expiry, yet
 the order book keeps quoting it as live. The engine reconstructs the settling
 average from free reference feeds, prices a calibrated win probability each second,
 and executes only when expected value clears modeled fees and a confidence gate.
+The live bot is the data-generating prerequisite; the research question — is this
+edge real, or noise — is the point (see [Live results](#live-results-honest-not-oversold)).
 
 *Vela — "the sail." It reckons settlement from the wind (public price feeds), then
 trades the gap between what is already decided and what the book is still pricing.*
+
+---
+
+## Live results (honest, not oversold)
+
+Realized PnL, reconciled to the cent against Kalshi's own settlements API.
+Indexed to hide account size — reproduce it with [`scripts/pnl_report.py`](scripts/pnl_report.py).
+
+| Metric | Value |
+|---|---|
+| Indexed equity | **≈1.40×** since the 2026-06-18 bankroll reset |
+| Realized PnL | **+$20.23** over **210** traded windows |
+| Hit rate | **97.6%** (205 W / 5 L) |
+| Per-window t-stat | **≈1.0 — not yet statistically significant** |
+
+The hit rate is the least trustworthy number here: the payoff is left-skewed (many
+small wins, a rare large loss), and N=210 doesn't yet clear its own noise. Whether
+the edge survives an honest significance test — HAC t-stat, block bootstrap,
+calibration, fill-conditional adverse selection — is the actual research; the live
+bot exists to keep generating the out-of-sample data that question needs. Work in
+progress in [`analysis/`](analysis/) and [`notebooks/`](notebooks/).
 
 ---
 
@@ -61,8 +86,7 @@ mispricing Vela harvests.
 3. Cross or rest into the final seconds **only at a positive-EV entry** (price
    floor/cap, fees modeled to the cent), holding to settlement.
 
-Convergence arithmetic and disciplined execution, not directional forecasting. Full
-thesis: [`STRATEGY.md`](STRATEGY.md).
+Convergence arithmetic and disciplined execution, not directional forecasting.
 
 ---
 
@@ -105,18 +129,27 @@ processes with independent kill-switches and daily-loss halts.
 ```
 vela/
 ├── livepaper/
-│   ├── feeds.py        Binance multi-symbol 1s WS + Kalshi authed WS (book/trade/lifecycle)
-│   ├── market.py       order book, per-market state, REST discovery, per-asset de-bias
-│   ├── engine.py       per-sec estimate + p_side gate + fill logic + settlement
-│   ├── live_exec.py    real Kalshi order lifecycle (place, poll fills, cancel, halt)
-│   ├── broker.py       LiveBroker (Kalshi REST) + MockBroker (tests)
-│   ├── store.py        SQLite (WAL)
-│   ├── config.py       all strategy params + live trading flags
-│   ├── report.py       PnL / win-rate summary  (python -m livepaper.report)
-│   ├── data_btc/       BTC bot data: paper.db, run.log
-│   └── data_eth/       ETH bot data: paper.db, run.log
-├── backtest/           historical data + analysis
-└── STRATEGY.md         strategy write-up
+│   ├── priceblend/      Binance 1s feed + causal de-bias — independent of Kalshi
+│   │   ├── feed.py
+│   │   ├── debias.py
+│   │   └── service.py
+│   ├── trading/         Kalshi book/orders/engine, driven by PriceBlend's output
+│   │   ├── kalshi_ws.py   Kalshi authed WS (book/trade/lifecycle)
+│   │   ├── book.py        order book + per-market state
+│   │   ├── discovery.py   REST market discovery + settlement lookups
+│   │   ├── engine.py      per-sec estimate + p_side gate + fill logic + settlement
+│   │   ├── projection.py  window projection (mhat/margin/sd_S/p_side)
+│   │   ├── live_exec.py   real Kalshi order lifecycle (place, poll fills, cancel, halt)
+│   │   ├── broker.py      LiveBroker (Kalshi REST) + MockBroker (tests)
+│   │   └── portfolio.py   shared live risk ledger (BTC/ETH split)
+│   ├── store.py         SQLite (WAL)
+│   ├── config.py        all strategy params + live trading flags
+│   ├── report.py        PnL / win-rate summary  (python -m livepaper.report)
+│   ├── data_btc/        BTC bot data: paper.db, run.log
+│   └── data_eth/        ETH bot data: paper.db, run.log
+├── analysis/            research notebooks — significance, calibration, attribution
+├── backtest/            historical data + strategy backtests
+└── scripts/             ops utilities: pnl_report.py, check_btc.py, show_strong.py
 ```
 
 Each second per tracked market: pull Binance feed → compute de-biased TWAP margin
@@ -164,4 +197,4 @@ in `livepaper/data_shared/portfolio.db`. Safe to query while running.
 | `LIVE_MAX_OPEN_NOTIONAL` / `LIVE_MAX_OPEN_FRACTION` | $25 / 0.50 | total resting+open exposure cap is max of floor and fraction |
 | `LIVE_MAX_DAILY_LOSS` | $25 BTC / $15 ETH | per-bot stop-loss (`VELA_MAX_DAILY_LOSS`) |
 | `STRONG_TAKE_THRESH` | 0.95 | taker pathway fires when ask ≥ this |
-| `RAW_DUMP` | True | writes raw Kalshi WS messages to disk (large; set False to disable) |
+| `RAW_DUMP` | False | writes raw Kalshi WS messages to disk (large; opt in to enable) |

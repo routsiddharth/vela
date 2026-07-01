@@ -1,7 +1,7 @@
 # livepaper — live forward-test of the TWAP panic-fade (multi-market)
 
 A self-contained live forward-test runner that runs the validated strategy
-(see [`../STRATEGY.md`](../STRATEGY.md)) against **live** data and records
+against **live** data and records
 everything second-by-second. With `VELA_LIVE=1`, it places real Kalshi orders;
 without it, it only watches the Kalshi order book / trade feed and books
 theoretical fills.
