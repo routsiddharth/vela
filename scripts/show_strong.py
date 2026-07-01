@@ -2,8 +2,8 @@
 """show_strong.py — history of the 'strong take' (>=0.95 taker) pathway.
 
 Run from the repo root:
-    python3 show_strong.py            # full history + summary
-    python3 show_strong.py --tail     # also tail the [strong] lines from run.log
+    python3 scripts/show_strong.py            # full history + summary
+    python3 scripts/show_strong.py --tail     # also tail the [strong] lines from run.log
 
 Read-only. Reconstructs every strong-pathway take from data_btc/paper.db (fills
 tagged 'strong095 taker' + orders tagged 'strong095'), joins each to the window's
@@ -14,7 +14,7 @@ ONLY the >=0.95 taker rule, not the panic-fade.
 import sqlite3, sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "livepaper" / "data_btc" / "paper.db"
 LOG = ROOT / "livepaper" / "data_btc" / "run.log"
 TAG_FILL, TAG_ORDER = "strong095 taker", "strong095"

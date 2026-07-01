@@ -5,10 +5,11 @@
 """
 import sqlite3, sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent / "backtest" / "strategy_search"))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "backtest" / "strategy_search"))
 from fees import order_fee, TAKER
 
-DB = Path(__file__).resolve().parent / "livepaper" / "data_btc" / "paper.db"
+DB = ROOT / "livepaper" / "data_btc" / "paper.db"
 c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
 
 THRESH_BY_SERIES = {"KXBTC15M": 0.95, "KXBTCD": 0.97}   # per-series take threshold

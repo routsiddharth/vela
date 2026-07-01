@@ -1,0 +1,13 @@
+decided estimate rows sampled: 58699
+
+(A) p_side / gate reconstruction:
+    |margin|>=thr  agrees with gate_active : 97.192%
+    recon p_side>=0.84 agrees with gate     : 97.192%
+    p_side range on gated rows: 0.507 .. 1.000
+
+(B) margin_hat == mhat - strike  (mhat is the spot-derived de-biased estimate):
+    median |error|: $0.0000   95pct: $0.0000   max: $0.0000
+    corr(spot, mhat): 1.0000   (mhat tracks spot, shifted by de-bias delta)
+    mean delta (de-bias) : $69.87
+
+verdict: signal is reconstructable from spot+strike+delta+sigma -> the public-data backtest can regenerate p_side without the Kalshi book.

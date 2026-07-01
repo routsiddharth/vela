@@ -2,7 +2,7 @@
 """check_btc.py — reconcile the LIVE BTC bot against the REAL Kalshi account.
 
 Run from the repo root:
-    python3 check_btc.py
+    python3 scripts/check_btc.py
 
 The account is shared with your manual trades, so the bot's own report is muddy.
 This matches the bot's orders to ACTUAL account fills by order_id and computes the
@@ -12,7 +12,7 @@ Read-only: it never places or cancels anything.
 import os, sqlite3, sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from livepaper.trading.broker import LiveBroker
 

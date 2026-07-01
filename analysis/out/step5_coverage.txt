@@ -1,0 +1,16 @@
+order placements (action='place'): 1356
+
+nearest book_snaps (same ticker) to each placement:
+  <=1s          1354  ( 99.9%)
+  1-2s             2  (  0.1%)
+  2-5s             0  (  0.0%)
+  5-10s            0  (  0.0%)
+  none(>10s)       0  (  0.0%)
+
+USABLE (book within 2s): 1356/1356 (100.0%)
+EXCLUDE (no book within 2s): 0 (0.0%)
+
+by placement type:
+  executed   n=   13  within2s=   13 (100.0%)
+  resting    n= 1076  within2s= 1076 (100.0%)
+  taker      n=  267  within2s=  267 (100.0%)

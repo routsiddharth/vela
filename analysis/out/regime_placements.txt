@@ -1,0 +1,4 @@
+placements per regime (action='place'):
+  R0_fixed5     214
+  DEAD_410        0
+  R1_stable    1142

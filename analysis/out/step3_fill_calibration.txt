@@ -1,0 +1,27 @@
+maker-fade attempts (distinct tickers): 1034
+filled: 88   overall fill rate: 8.5%
+
+fill rate by regime:
+  R0_fixed5     13/159  =   8.2%
+  R1_stable     75/875  =   8.6%
+
+P(fill | distance-of-bid-below-mid)  [Beta-Binomial posterior, 95% CI]:
+  <=0 (at/above mid)   n=  11 fill= 38.5%  [15.2, 65.1]
+  0-2c                 n= 243 fill= 23.7%  [18.6, 29.2]
+  2-5c                 n=   1 fill= 33.3%  [ 1.3, 84.2]
+  5-10c                n=   1 fill= 66.7%  [15.8, 98.7]
+
+P(fill | time-to-close):
+  5-15s      n=   1 fill= 33.3%  [ 1.3, 84.2]
+  15-30s     n=   4 fill= 16.7%  [ 0.5, 52.2]
+  30-45s     n=1029 fill=  8.6%  [ 7.0, 10.4]
+
+=== ADVERSE SELECTION ===
+  model p_side at decision (filled trades) : 0.9795
+  REALIZED win rate (filled trades)        : 0.9659  (n=88)
+  gap (realized - model)                   : -0.0135
+  mean p_side of UNFILLED                  : 0.9976  (n=946)
+  E[PnL | fill] per attempt                : $0.1803
+  mean contracts (filled)                  : 7.0
+
+written -> analysis/data/fill_calibration_btc.parquet  (22 cols)
