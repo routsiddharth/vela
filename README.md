@@ -33,8 +33,9 @@ The hit rate is the least trustworthy number here: the payoff is left-skewed (ma
 small wins, a rare large loss), and N=210 doesn't yet clear its own noise. Whether
 the edge survives an honest significance test — HAC t-stat, block bootstrap,
 calibration, fill-conditional adverse selection — is the actual research; the live
-bot exists to keep generating the out-of-sample data that question needs. Work in
-progress in [`analysis/`](analysis/) and [`notebooks/`](notebooks/).
+bot exists to keep generating the out-of-sample data that question needs. That
+analysis lives in [`notebooks/analysis.ipynb`](notebooks/analysis.ipynb) — the main
+research artifact — with supporting scripts in [`analysis/`](analysis/).
 
 ---
 
@@ -128,6 +129,10 @@ processes with independent kill-switches and daily-loss halts.
 
 ```
 vela/
+├── notebooks/
+│   └── analysis.ipynb   ★ MAIN ARTIFACT — the research writeup (de-bias fit,
+│                          settlement decomposition, probability calibration,
+│                          fill-conditional adverse selection, PnL attribution)
 ├── livepaper/
 │   ├── priceblend/      Binance 1s feed + causal de-bias — independent of Kalshi
 │   │   ├── feed.py
@@ -147,10 +152,18 @@ vela/
 │   ├── report.py        PnL / win-rate summary  (python -m livepaper.report)
 │   ├── data_btc/        BTC bot data: paper.db, run.log
 │   └── data_eth/        ETH bot data: paper.db, run.log
-├── analysis/            research notebooks — significance, calibration, attribution
+├── analysis/            research scripts feeding the notebook — signal
+│                          validation, fill calibration, book coverage
 ├── backtest/            historical data + strategy backtests
 └── scripts/             ops utilities: pnl_report.py, check_btc.py, show_strong.py
 ```
+
+**Start here:** [`notebooks/analysis.ipynb`](notebooks/analysis.ipynb) is the main
+artifact — it takes the live data and works the research question end to end: the
+Binance→RTI de-bias fit, what actually determines settlement, probability
+calibration, fill-conditional adverse selection, and PnL attribution by bucket.
+Everything under `livepaper/` is the live engine that generates the data the
+notebook analyzes; `analysis/` holds the scripts that stage it.
 
 Each second per tracked market: pull Binance feed → compute de-biased TWAP margin
 and `p_side` → at 45s lock the bet if gate passes → place real maker limit bid →
