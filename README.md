@@ -17,9 +17,9 @@ trades the gap between what is already decided and what the book is still pricin
 
 ---
 
-## Live results (honest, not oversold)
+## Live results 
 
-Realized PnL, reconciled to the cent against Kalshi's own settlements API.
+Realized PnL reconciled to the cent.
 Indexed to hide account size — reproduce it with [`scripts/pnl_report.py`](scripts/pnl_report.py).
 
 | Metric | Value |
